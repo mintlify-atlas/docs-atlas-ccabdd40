@@ -1,80 +1,233 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get your Prompt Tips API running in under 5 minutes with real data and voting
 ---
 
-## Get started in three steps
+# Quickstart
 
-Get your documentation site running locally and make your first customization.
+Get a working Prompt Tips API running locally in under 5 minutes. This guide walks you through installation, seeding sample data, and making your first API calls.
 
-### Step 1: Set up your local environment
+## Prerequisites
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- Node.js 16 or higher
+- npm or yarn
 
-### Step 2: Deploy your changes
+## Setup
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Steps>
+  <Step title="Install dependencies">
+    Clone the repository and install packages:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    git clone https://github.com/asifshaikat/prompt-tips.git
+    cd prompt-tips
+    npm install
+    ```
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Configure environment">
+    Create your `.env` file from the example:
 
-### Step 3: Go live
+    ```bash
+    cp .env.example .env
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    The defaults work for local development:
 
-## Next steps
+    ```bash .env
+    PORT=3000
+    DATA_DIR=./data
+    CACHE_MAX_AGE=60
+    STALE_WHILE_REVALIDATE=300
+    MAX_JSON_BODY=4096
+    ```
+  </Step>
 
-Now that you have your docs running, explore these key features:
+  <Step title="Seed sample data">
+    Load the sample tips from the YAML seed file:
+
+    ```bash
+    npm run seed
+    ```
+
+    This creates per-tip files from `data/seeds/tips.seed.yaml`:
+
+    ```
+    Seeded 4 tips.
+    ```
+  </Step>
+
+  <Step title="Build global view">
+    Generate the double-buffered global index:
+
+    ```bash
+    npm run rebuild
+    ```
+
+    You should see:
+
+    ```
+    Rebuilt global view → b tips: 4
+    ```
+  </Step>
+
+  <Step title="Start the server">
+    Launch the API server:
+
+    <CodeGroup>
+    ```bash npm
+    npm run dev
+    ```
+
+    ```bash direct
+    NODE_ENV=development node src/server.js
+    ```
+    </CodeGroup>
+
+    The server starts on port 3000:
+
+    ```
+    [tips] listening on :3000
+    ```
+  </Step>
+</Steps>
+
+## Try it out
+
+### List all tips (hot sorting)
+
+```bash
+curl http://localhost:3000/api/tips
+```
+
+<CodeGroup>
+```json Response
+{
+  "items": [
+    {
+      "id": 1,
+      "slug": "be-explicit-about-output-format",
+      "title": "Be explicit about output format",
+      "content": "Ask for JSON with a schema or a bullet list with exact fields. Models follow structure better than vague requests.",
+      "tags": ["format", "json"],
+      "status": "published",
+      "created_at": "2025-01-01T09:00:00Z",
+      "updated_at": "2025-01-01T09:00:00Z",
+      "love_count": 0,
+      "meh_count": 0
+    }
+  ],
+  "nextCursor": "2025-01-01T09:00:00Z_1",
+  "cachedAt": "2026-03-03T15:30:00.000Z"
+}
+```
+</CodeGroup>
+
+### Get a specific tip
+
+```bash
+curl http://localhost:3000/api/tips/1
+```
+
+### Cast a vote
+
+Vote with `1` (love), `0` (neutral), or `-1` (meh):
+
+```bash
+curl -X POST http://localhost:3000/api/tips/1/vote \
+  -H "Content-Type: application/json" \
+  -d '{"vote": 1, "userToken": "u_demo_user_123"}'
+```
+
+<CodeGroup>
+```json Response
+{
+  "id": 1,
+  "love_count": 1,
+  "meh_count": 0
+}
+```
+</CodeGroup>
+
+<Info>
+The `userToken` is a client-generated identifier. The same token can change votes but can't vote twice on the same tip.
+</Info>
+
+### Pagination and filtering
+
+Fetch the next page with the cursor:
+
+```bash
+curl "http://localhost:3000/api/tips?sort=hot&limit=2&cursor=2025-01-01T09:00:00Z_1"
+```
+
+Filter by time window:
+
+<CodeGroup>
+```bash 24 hours
+curl "http://localhost:3000/api/tips?window=24h"
+```
+
+```bash 7 days
+curl "http://localhost:3000/api/tips?window=7d"
+```
+
+```bash All time
+curl "http://localhost:3000/api/tips?window=all"
+```
+</CodeGroup>
+
+Change sort strategy:
+
+<CodeGroup>
+```bash Hot (default)
+curl "http://localhost:3000/api/tips?sort=hot"
+```
+
+```bash New
+curl "http://localhost:3000/api/tips?sort=new"
+```
+
+```bash Top
+curl "http://localhost:3000/api/tips?sort=top"
+```
+</CodeGroup>
+
+## Test caching with ETags
+
+The API returns ETags for cache validation. Make the same request twice:
+
+```bash
+# First request - full response
+curl -i http://localhost:3000/api/tips
+
+# Copy the ETag from the response header
+# Example: ETag: "v-a1b2c3d4e5f6"
+
+# Second request with If-None-Match
+curl -i http://localhost:3000/api/tips \
+  -H 'If-None-Match: "v-a1b2c3d4e5f6"'
+```
+
+The second request returns `304 Not Modified` with no body, saving bandwidth.
+
+## View in browser
+
+Open http://localhost:3000 to see the simple web interface with voting buttons and sort tabs.
+
+## What's next?
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore all endpoints and parameters
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Learn how the filesystem storage works
+  </Card>
+  <Card title="Deployment" icon="server" href="/guides/deployment">
+    Deploy to production with systemd and nginx
+  </Card>
+  <Card title="Voting System" icon="heart" href="/concepts/voting-system">
+    Understand atomic file locking for votes
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

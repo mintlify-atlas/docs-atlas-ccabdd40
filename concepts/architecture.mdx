@@ -1,0 +1,215 @@
+---
+title: Architecture
+description: Learn about Prompt Tips' filesystem-based architecture and how data flows through the system
+---
+
+Prompt Tips uses a **filesystem-based architecture** that eliminates the need for traditional databases. All data is stored in JSON and YAML files, organized in a sharded directory structure for optimal performance.
+
+## Overview
+
+The architecture is built around three core principles:
+
+1. **File-based storage** - Tips, votes, and views stored as files
+2. **Sharded organization** - Data distributed across 1000 shards (000-999)
+3. **Pre-computed views** - Read-optimized JSON files for fast API responses
+
+<Note>
+This approach provides excellent performance for read-heavy workloads while maintaining simplicity and avoiding database dependencies.
+</Note>
+
+## Directory structure
+
+```
+data/
+├── tips/
+│   ├── 000/
+│   │   ├── tip-000000.yaml          # Source tip content
+│   │   ├── tip-000000.view.json     # Denormalized view with counts
+│   │   ├── tip-000000.votes.map.json   # User votes mapping
+│   │   └── tip-000000.votes.log.jsonl  # Audit log
+│   ├── 001/
+│   └── ...
+├── .locks/
+│   └── tip-{id}.lock                # File locks for atomic voting
+├── tips.view.a.json                 # Double-buffered global view A
+├── tips.view.b.json                 # Double-buffered global view B
+└── tips.view.ptr                    # Points to active view ('a' or 'b')
+```
+
+## Sharding strategy
+
+Tips are distributed across 1000 shards using modulo-based partitioning:
+
+```javascript
+// From src/lib/utils.js:3
+export function shard(id){
+  return String(Number(id) % 1000).padStart(3,'0');
+}
+```
+
+For example:
+- Tip ID 1 → shard `001`
+- Tip ID 1000 → shard `000`
+- Tip ID 1234 → shard `234`
+
+<Tip>
+Sharding prevents any single directory from becoming too large, which would degrade filesystem performance.
+</Tip>
+
+## File types explained
+
+### Source files (.yaml)
+
+The canonical source of truth for tip content:
+
+```yaml
+id: 1
+title: "Use XML tags for structured prompts"
+content: "When working with Claude..."
+tags: ["prompting", "xml"]
+status: "published"
+created_at: "2024-03-15T10:30:00Z"
+updated_at: "2024-03-15T10:30:00Z"
+```
+
+### View files (.view.json)
+
+Pre-computed, denormalized views that include vote counts:
+
+```json
+{
+  "id": 1,
+  "slug": "use-xml-tags-for-structured-prompts",
+  "title": "Use XML tags for structured prompts",
+  "content": "When working with Claude...",
+  "tags": ["prompting", "xml"],
+  "status": "published",
+  "created_at": "2024-03-15T10:30:00Z",
+  "updated_at": "2024-03-15T10:30:00Z",
+  "love_count": 42,
+  "meh_count": 3
+}
+```
+
+### Vote map (.votes.map.json)
+
+Tracks which users voted and their vote value:
+
+```json
+{
+  "user-token-abc123": 1,
+  "user-token-def456": -1,
+  "user-token-ghi789": 1
+}
+```
+
+<Info>
+The vote map enables vote deduplication and allows users to change their votes.
+</Info>
+
+### Vote log (.votes.log.jsonl)
+
+Append-only audit trail in JSON Lines format:
+
+```jsonl
+{"userToken":"abc123","old":0,"vote":1,"ts":"2024-03-15T10:30:00Z"}
+{"userToken":"abc123","old":1,"vote":-1,"ts":"2024-03-15T11:45:00Z"}
+```
+
+## Data flow
+
+### Reading tips
+
+1. Request arrives at `/api/tips`
+2. ViewStore reads from active global view file (tips.view.a.json or tips.view.b.json)
+3. Results sorted and paginated in-memory
+4. Response sent with ETag and cache headers
+
+```javascript
+// From src/server.js:23
+app.get('/api/tips', (req, res) => {
+  store.headers(res);
+  const { sort='hot', window='all', cursor, limit=20 } = req.query;
+  const { items, nextCursor } = store.select({ sort, window, cursor, limit });
+  const payload = { items, nextCursor, cachedAt: new Date().toISOString() };
+  // ...
+});
+```
+
+### Writing votes
+
+1. Request arrives at `/api/tips/:id/vote`
+2. File lock acquired for tip
+3. Vote map loaded and updated
+4. Per-tip view file patched with new counts
+5. In-memory global view updated
+6. Tip marked dirty for batch flush
+7. Lock released
+
+<Warning>
+If a lock cannot be acquired, the API returns HTTP 429 (Too Many Requests) and the client should retry.
+</Warning>
+
+## Path resolution
+
+The `tipPaths()` utility generates all file paths for a tip:
+
+```javascript
+// From src/lib/utils.js:7
+export function tipPaths(DATA, id){
+  const s = shard(id);
+  const base = `${DATA}/tips/${s}/tip-${String(id).padStart(6,'0')}`;
+  return {
+    dir: `${DATA}/tips/${s}`,
+    yaml: `${base}.yaml`,
+    view: `${base}.view.json`,
+    votesMap: `${base}.votes.map.json`,
+    votesLog: `${base}.votes.log.jsonl`,
+    lock: `${DATA}/.locks/tip-${id}.lock`
+  };
+}
+```
+
+## Atomic writes
+
+All file writes use the write-then-rename pattern to ensure atomicity:
+
+```javascript
+// From src/lib/utils.js:40
+export async function atomicWrite(fs, file, obj){
+  const tmp = `${file}.tmp`;
+  await fs.writeFile(tmp, typeof obj==='string'? obj : JSON.stringify(obj));
+  await fs.rename(tmp, file);
+}
+```
+
+<Tip>
+Filesystem rename operations are atomic on most operating systems, preventing partial writes from being read.
+</Tip>
+
+## Initialization
+
+On startup, the ViewStore initializes by:
+
+```javascript
+// From src/lib/viewStore.js:19
+async init(){
+  await fs.mkdir(this.DATA, { recursive: true });
+  await fs.mkdir(path.join(this.DATA, '.locks'), { recursive: true });
+  const ptrFile = path.join(this.DATA, 'tips.view.ptr');
+  try{ this.ptr = (await fs.readFile(ptrFile,'utf8')).trim() || 'a'; }
+  catch{ await fs.writeFile(ptrFile,'a'); this.ptr = 'a'; }
+  const active = this._activePath();
+  try{
+    const buf = await fs.readFile(active, 'utf8');
+    this.mem = JSON.parse(buf);
+  }catch{
+    await this.rebuildGlobal();
+  }
+}
+```
+
+1. Creating required directories
+2. Reading the pointer file to determine active view
+3. Loading the active global view into memory
+4. Rebuilding if no view exists

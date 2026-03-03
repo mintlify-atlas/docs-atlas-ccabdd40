@@ -1,0 +1,353 @@
+---
+title: Utility functions
+description: Helper functions for scoring, file paths, atomic operations, and data filtering
+---
+
+The utilities module provides essential helper functions used throughout Prompt Tips for ranking algorithms, file system operations, and data manipulation.
+
+## Scoring and ranking
+
+### hot(score, created_at)
+
+Calculates a Reddit-style "hot" ranking score that balances popularity with recency.
+
+```javascript
+import { hot } from './lib/utils.js';
+
+const score = tip.love_count - tip.meh_count;
+const hotness = hot(score, tip.created_at);
+```
+
+<ParamField path="score" type="number" required>
+  Net score (typically upvotes minus downvotes). Absolute value is used, with a minimum of 1.
+</ParamField>
+
+<ParamField path="created_at" type="string" required>
+  ISO 8601 timestamp string (e.g., `"2024-03-15T10:30:00.000Z"`).
+</ParamField>
+
+<ResponseField name="return" type="number">
+  Hot score. Higher values indicate more "hot" content that should rank higher.
+</ResponseField>
+
+**Algorithm:**
+```javascript
+const s = Math.max(Math.abs(score), 1);
+return Math.log10(s) + (Date.parse(created_at)/1000)/45000;
+```
+
+- Uses logarithmic scaling for score (so 100 votes ≈ 10x better than 10 votes)
+- Adds a time component that decays over ~12.5 hours (45000 seconds)
+- Newer content with similar scores ranks higher
+
+<Tip>
+  The hot algorithm naturally promotes trending content. A tip with 10 net votes posted today will outrank a tip with 100 votes from last week.
+</Tip>
+
+---
+
+### wilson(love, meh, z)
+
+Calculates the lower bound of the Wilson score confidence interval for a Bernoulli parameter. This is the "best" sorting algorithm for vote-based systems.
+
+```javascript
+import { wilson } from './lib/utils.js';
+
+const confidence = wilson(tip.love_count, tip.meh_count);
+```
+
+<ParamField path="love" type="number" required>
+  Number of positive votes (loves/upvotes).
+</ParamField>
+
+<ParamField path="meh" type="number" required>
+  Number of negative votes (mehs/downvotes).
+</ParamField>
+
+<ParamField path="z" type="number" default="1.96">
+  Z-score for confidence level. Default 1.96 corresponds to 95% confidence.
+</ParamField>
+
+<ResponseField name="return" type="number">
+  Wilson score (0-1). Returns 0 if no votes. Higher scores indicate better quality with statistical confidence.
+</ResponseField>
+
+**Why Wilson score?**
+- Unlike simple ratios, it accounts for vote volume
+- A tip with 2/2 (100%) won't outrank one with 99/100 (99%)
+- Provides a conservative estimate that's fair to both popular and niche content
+
+**Example comparisons:**
+```javascript
+wilson(2, 0);    // 0.34 - Low confidence despite 100% ratio
+wilson(99, 1);   // 0.91 - High confidence, lots of data
+wilson(100, 0);  // 0.96 - Very high confidence
+wilson(0, 0);    // 0.00 - No data
+```
+
+<Note>
+  This is the same algorithm used by Reddit for "best" comment sorting. It's mathematically proven to be the optimal way to rank items with positive/negative votes.
+</Note>
+
+---
+
+## File system utilities
+
+### shard(id)
+
+Computes a shard identifier for distributing tip files across directories.
+
+```javascript
+import { shard } from './lib/utils.js';
+
+const s = shard(1234);
+// "234"
+```
+
+<ParamField path="id" type="number" required>
+  Tip ID.
+</ParamField>
+
+<ResponseField name="return" type="string">
+  3-digit shard identifier (000-999), zero-padded.
+</ResponseField>
+
+**Algorithm:**
+```javascript
+String(Number(id) % 1000).padStart(3, '0')
+```
+
+**Why sharding?**
+- Prevents filesystem performance degradation with 10,000+ files in one directory
+- Distributes files evenly across 1,000 subdirectories
+- Each shard contains ~1% of all tips
+
+**Examples:**
+```javascript
+shard(1);       // "001"
+shard(42);      // "042"
+shard(1234);    // "234"
+shard(999999);  // "999"
+```
+
+---
+
+### tipPaths(DATA, id)
+
+Generates all file paths related to a specific tip.
+
+```javascript
+import { tipPaths } from './lib/utils.js';
+
+const paths = tipPaths('./data', 1234);
+```
+
+<ParamField path="DATA" type="string" required>
+  Root data directory path.
+</ParamField>
+
+<ParamField path="id" type="number" required>
+  Tip ID.
+</ParamField>
+
+<ResponseField name="dir" type="string">
+  Shard directory path (e.g., `"./data/tips/234"`).
+</ResponseField>
+
+<ResponseField name="yaml" type="string">
+  Path to tip source YAML file (e.g., `"./data/tips/234/tip-001234.yaml"`).
+</ResponseField>
+
+<ResponseField name="view" type="string">
+  Path to tip view JSON file (e.g., `"./data/tips/234/tip-001234.view.json"`).
+</ResponseField>
+
+<ResponseField name="votesMap" type="string">
+  Path to votes map JSON file (e.g., `"./data/tips/234/tip-001234.votes.map.json"`).
+</ResponseField>
+
+<ResponseField name="votesLog" type="string">
+  Path to votes audit log (e.g., `"./data/tips/234/tip-001234.votes.log.jsonl"`).
+</ResponseField>
+
+<ResponseField name="lock" type="string">
+  Path to lock file for atomic operations (e.g., `"./data/.locks/tip-1234.lock"`).
+</ResponseField>
+
+**Example output:**
+```javascript
+{
+  dir: './data/tips/234',
+  yaml: './data/tips/234/tip-001234.yaml',
+  view: './data/tips/234/tip-001234.view.json',
+  votesMap: './data/tips/234/tip-001234.votes.map.json',
+  votesLog: './data/tips/234/tip-001234.votes.log.jsonl',
+  lock: './data/.locks/tip-1234.lock'
+}
+```
+
+<Tip>
+  Use `tipPaths()` to ensure consistent file naming across the codebase. All tip-related operations should use these paths.
+</Tip>
+
+---
+
+### atomicWrite(fs, file, obj)
+
+Writes a file atomically using write-then-rename to prevent corruption from concurrent reads.
+
+```javascript
+import { atomicWrite } from './lib/utils.js';
+import fs from 'node:fs/promises';
+
+await atomicWrite(fs, './data/tip.json', { id: 1, title: 'Example' });
+```
+
+<ParamField path="fs" type="fs.promises" required>
+  Node.js `fs.promises` module.
+</ParamField>
+
+<ParamField path="file" type="string" required>
+  Target file path.
+</ParamField>
+
+<ParamField path="obj" type="object | string" required>
+  Data to write. Objects are JSON.stringify'd, strings are written as-is.
+</ParamField>
+
+<ResponseField name="return" type="Promise<void>">
+  Resolves when write is complete.
+</ResponseField>
+
+**How it works:**
+1. Writes to `{file}.tmp`
+2. Atomically renames to `{file}` (overwrites existing)
+3. On most filesystems, rename is atomic - readers never see partial data
+
+<Note>
+  This pattern is crucial for multi-process environments. Without atomic writes, a reader might see half-written JSON and crash.
+</Note>
+
+---
+
+## Data filtering
+
+### seekFilter(items, cursor)
+
+Filters an array of items using seek-based cursor pagination.
+
+```javascript
+import { seekFilter } from './lib/utils.js';
+
+const filtered = seekFilter(allItems, '2024-03-15T10:30:00.000Z_42');
+```
+
+<ParamField path="items" type="Array<object>" required>
+  Array of items to filter. Each item must have `created_at` (ISO string) and `id` (number) properties.
+</ParamField>
+
+<ParamField path="cursor" type="string | null" required>
+  Cursor in format `"YYYY-MM-DDTHH:mm:ss.sssZ_id"`, or `null` to return all items.
+</ParamField>
+
+<ResponseField name="return" type="Array<object>">
+  Items that come after the cursor position. If cursor is `null`, returns all items.
+</ResponseField>
+
+**Algorithm:**
+```javascript
+const [iso, idStr] = cursor.split('_');
+const cAt = Date.parse(iso);
+const cId = Number(idStr);
+return items.filter(x => 
+  Date.parse(x.created_at) < cAt || 
+  (Date.parse(x.created_at) === cAt && x.id < cId)
+);
+```
+
+**Why seek-based pagination?**
+- Stable: New items don't cause page drift
+- Fast: O(n) filter, no database offset scan
+- Works with any sort order (as long as created_at + id are in the sort)
+
+**Example:**
+```javascript
+const items = [
+  { id: 3, created_at: '2024-03-15T12:00:00.000Z', title: 'Newest' },
+  { id: 2, created_at: '2024-03-15T11:00:00.000Z', title: 'Middle' },
+  { id: 1, created_at: '2024-03-15T10:00:00.000Z', title: 'Oldest' }
+];
+
+seekFilter(items, null);
+// Returns all 3 items
+
+seekFilter(items, '2024-03-15T11:00:00.000Z_2');
+// Returns [{ id: 1, ... }] - only items older than the cursor
+```
+
+<Tip>
+  The cursor format `created_at_id` ensures uniqueness even when multiple items have the same timestamp. Always include both values.
+</Tip>
+
+---
+
+## Other utilities
+
+### sleep(ms)
+
+Returns a promise that resolves after a delay.
+
+```javascript
+import { sleep } from './lib/utils.js';
+
+await sleep(1000); // Wait 1 second
+console.log('Done waiting');
+```
+
+<ParamField path="ms" type="number" required>
+  Delay in milliseconds.
+</ParamField>
+
+<ResponseField name="return" type="Promise<void>">
+  Resolves after the specified delay.
+</ResponseField>
+
+---
+
+## Usage Example
+
+Here's how these utilities work together in a typical workflow:
+
+```javascript
+import { hot, wilson, shard, tipPaths, atomicWrite } from './lib/utils.js';
+import fs from 'node:fs/promises';
+
+// Load a tip and calculate scores
+const tip = {
+  id: 1234,
+  title: 'Use structured outputs',
+  created_at: '2024-03-15T10:00:00.000Z',
+  love_count: 42,
+  meh_count: 3
+};
+
+const score = tip.love_count - tip.meh_count;
+const hotScore = hot(score, tip.created_at);
+const wilsonScore = wilson(tip.love_count, tip.meh_count);
+
+console.log('Hot score:', hotScore);     // 1.59 (trending)
+console.log('Wilson score:', wilsonScore); // 0.82 (high quality)
+
+// Get file paths
+const paths = tipPaths('./data', tip.id);
+console.log('Shard:', shard(tip.id));      // "234"
+console.log('View file:', paths.view);     // ./data/tips/234/tip-001234.view.json
+
+// Save atomically
+const viewData = {
+  ...tip,
+  hot_score: hotScore,
+  wilson_score: wilsonScore
+};
+await atomicWrite(fs, paths.view, viewData);
+```

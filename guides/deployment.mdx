@@ -1,0 +1,363 @@
+---
+title: Deployment
+description: Deploy Prompt Tips to production with systemd service management and environment configuration
+---
+
+This guide covers deploying Prompt Tips as a production service on Linux using systemd, including environment configuration and process management.
+
+## Prerequisites
+
+Before deploying, ensure you have:
+
+- Node.js 18+ installed
+- A Linux server with systemd (Ubuntu 20.04+, Debian 11+, etc.)
+- Root or sudo access
+- Git (for cloning the repository)
+
+## Deployment steps
+
+<Steps>
+  <Step title="Clone the repository">
+    Clone to a system directory like `/opt`:
+    
+    ```bash
+    sudo mkdir -p /opt/prompt-tips
+    sudo git clone https://github.com/your-org/prompt-tips.git /opt/prompt-tips
+    cd /opt/prompt-tips
+    ```
+  </Step>
+  
+  <Step title="Install dependencies">
+    Install Node.js dependencies:
+    
+    ```bash
+    npm install --production
+    ```
+    
+    <Tip>
+    The `--production` flag skips devDependencies, reducing disk usage and attack surface.
+    </Tip>
+  </Step>
+  
+  <Step title="Create data directory">
+    Set up the persistent data directory:
+    
+    ```bash
+    sudo mkdir -p /var/lib/prompt-tips/data/seeds
+    sudo chown -R www-data:www-data /var/lib/prompt-tips
+    ```
+  </Step>
+  
+  <Step title="Configure environment">
+    Create a production environment file:
+    
+    ```bash
+    sudo nano /opt/prompt-tips/.env.production
+    ```
+    
+    Add your configuration (see [Environment variables](#environment-variables) below).
+  </Step>
+  
+  <Step title="Seed initial data">
+    Copy your seed file and run the seed script:
+    
+    ```bash
+    sudo cp data/seeds/tips.seed.yaml /var/lib/prompt-tips/data/seeds/
+    sudo -u www-data DATA_DIR=/var/lib/prompt-tips/data node scripts/seed.mjs
+    sudo -u www-data DATA_DIR=/var/lib/prompt-tips/data node scripts/rebuild-global-view.mjs
+    ```
+  </Step>
+  
+  <Step title="Install systemd service">
+    Copy the service file and enable it:
+    
+    ```bash
+    sudo cp deploy/prompt-tips.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable prompt-tips
+    sudo systemctl start prompt-tips
+    ```
+  </Step>
+  
+  <Step title="Verify the service">
+    Check that the service is running:
+    
+    ```bash
+    sudo systemctl status prompt-tips
+    ```
+    
+    You should see `active (running)` status.
+  </Step>
+  
+  <Step title="Test the API">
+    Verify the API responds:
+    
+    ```bash
+    curl http://localhost:3000/api/tips
+    ```
+  </Step>
+</Steps>
+
+## Systemd service configuration
+
+The provided service file at `deploy/prompt-tips.service`:
+
+```ini deploy/prompt-tips.service
+[Unit]
+Description=Prompt Tips server (no-DB)
+After=network.target
+
+[Service]
+Type=simple
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=DATA_DIR=/var/lib/prompt-tips/data
+Environment=CACHE_MAX_AGE=60
+Environment=STALE_WHILE_REVALIDATE=300
+WorkingDirectory=/opt/prompt-tips
+ExecStart=/usr/bin/node /opt/prompt-tips/src/server.js
+Restart=always
+RestartSec=5
+User=www-data
+Group=www-data
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Key directives
+
+- `Type=simple` - Standard foreground process
+- `Restart=always` - Auto-restart on crashes
+- `RestartSec=5` - Wait 5 seconds before restarting
+- `User=www-data` - Run as unprivileged user for security
+- `LimitNOFILE=65536` - Increase file descriptor limit
+
+<Warning>
+Never run the service as `root`. Always use a dedicated unprivileged user like `www-data` or create a `prompt-tips` user.
+</Warning>
+
+## Environment variables
+
+Configure these in the systemd service file or via an environment file:
+
+### Core settings
+
+```bash .env.production
+NODE_ENV=production
+PORT=3000
+DATA_DIR=/var/lib/prompt-tips/data
+```
+
+- `NODE_ENV` - Set to `production` for optimizations
+- `PORT` - Port to listen on (default: 3000)
+- `DATA_DIR` - Absolute path to data directory
+
+### Cache settings
+
+```bash .env.production
+CACHE_MAX_AGE=60
+STALE_WHILE_REVALIDATE=300
+```
+
+- `CACHE_MAX_AGE` - Cache-Control max-age in seconds (default: 60)
+- `STALE_WHILE_REVALIDATE` - Stale-while-revalidate window in seconds (default: 300)
+
+<Info>
+These cache headers work in conjunction with nginx caching (see [nginx setup](/guides/nginx-setup)).
+</Info>
+
+### Request limits
+
+```bash .env.production
+MAX_JSON_BODY=4096
+```
+
+- `MAX_JSON_BODY` - Maximum request body size in bytes (default: 4096)
+
+<Tip>
+Keep `MAX_JSON_BODY` small to prevent abuse. Vote requests only need ~100 bytes.
+</Tip>
+
+## Managing the service
+
+### Start/stop/restart
+
+```bash
+# Start the service
+sudo systemctl start prompt-tips
+
+# Stop the service
+sudo systemctl stop prompt-tips
+
+# Restart the service
+sudo systemctl restart prompt-tips
+
+# Reload after config changes
+sudo systemctl daemon-reload
+sudo systemctl restart prompt-tips
+```
+
+### View logs
+
+```bash
+# Follow live logs
+sudo journalctl -u prompt-tips -f
+
+# View last 100 lines
+sudo journalctl -u prompt-tips -n 100
+
+# View logs from today
+sudo journalctl -u prompt-tips --since today
+```
+
+### Check status
+
+```bash
+sudo systemctl status prompt-tips
+```
+
+Healthy output:
+
+```
+● prompt-tips.service - Prompt Tips server (no-DB)
+   Loaded: loaded (/etc/systemd/system/prompt-tips.service; enabled)
+   Active: active (running) since Mon 2026-03-03 10:15:23 UTC; 2h 34min ago
+ Main PID: 1234 (node)
+    Tasks: 11 (limit: 4915)
+   Memory: 45.2M
+   CGroup: /system.slice/prompt-tips.service
+           └─1234 /usr/bin/node /opt/prompt-tips/src/server.js
+```
+
+## Updating the application
+
+<Steps>
+  <Step title="Pull latest code">
+    ```bash
+    cd /opt/prompt-tips
+    sudo git pull
+    sudo npm install --production
+    ```
+  </Step>
+  
+  <Step title="Restart the service">
+    ```bash
+    sudo systemctl restart prompt-tips
+    ```
+  </Step>
+  
+  <Step title="Verify">
+    ```bash
+    sudo systemctl status prompt-tips
+    curl http://localhost:3000/api/tips
+    ```
+  </Step>
+</Steps>
+
+<Info>
+Zero-downtime deployments require a reverse proxy with graceful reload. See [nginx setup](/guides/nginx-setup) for configuration.
+</Info>
+
+## Security considerations
+
+### File permissions
+
+Ensure restrictive permissions:
+
+```bash
+# Application files (read-only for www-data)
+sudo chown -R root:root /opt/prompt-tips
+sudo chmod -R 755 /opt/prompt-tips
+
+# Data directory (read-write for www-data)
+sudo chown -R www-data:www-data /var/lib/prompt-tips
+sudo chmod -R 750 /var/lib/prompt-tips
+```
+
+### Firewall
+
+Block direct access to port 3000, only allow from localhost:
+
+```bash
+# Using ufw
+sudo ufw deny 3000
+
+# Using iptables
+sudo iptables -A INPUT -p tcp --dport 3000 -s 127.0.0.1 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 3000 -j DROP
+```
+
+<Warning>
+Always run the application behind a reverse proxy (nginx, Caddy, etc.). Never expose the Node.js server directly to the internet.
+</Warning>
+
+### Resource limits
+
+The service file includes `LimitNOFILE=65536`. Add additional limits if needed:
+
+```ini
+LimitNPROC=512       # Max processes
+LimitAS=2G           # Max address space (memory)
+LimitCPU=3600        # Max CPU time (seconds)
+```
+
+## Monitoring
+
+### Health check endpoint
+
+If your server implements a health check endpoint, monitor it:
+
+```bash
+curl http://localhost:3000/health
+```
+
+### Process monitoring
+
+Use systemd's built-in monitoring:
+
+```bash
+# Check if service is active
+systemctl is-active prompt-tips
+
+# Get service uptime
+systemctl show prompt-tips --property=ActiveEnterTimestamp
+```
+
+### Automated alerts
+
+Set up email alerts on service failure:
+
+```ini /etc/systemd/system/prompt-tips.service
+[Unit]
+OnFailure=status-email@%n.service
+```
+
+## Backup
+
+Regularly back up the data directory:
+
+```bash
+# Create timestamped backup
+sudo tar czf /backups/prompt-tips-$(date +%Y%m%d-%H%M%S).tar.gz \
+  /var/lib/prompt-tips/data
+
+# Restore from backup
+sudo systemctl stop prompt-tips
+sudo tar xzf /backups/prompt-tips-20260303-101523.tar.gz -C /
+sudo systemctl start prompt-tips
+```
+
+<Tip>
+Store backups off-server using rsync, rclone, or cloud storage for disaster recovery.
+</Tip>
+
+## Next steps
+
+After deploying the service:
+
+1. [Set up nginx](/guides/nginx-setup) as a reverse proxy with caching
+2. [Configure automatic view rebuilds](/guides/rebuilding-views#automation)
+3. Set up monitoring and alerting
+4. Configure SSL/TLS with Let's Encrypt

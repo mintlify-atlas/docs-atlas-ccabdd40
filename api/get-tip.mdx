@@ -1,0 +1,193 @@
+---
+title: Get tip
+description: Retrieve a single prompt tip by its unique identifier
+---
+
+## Endpoint
+
+```
+GET /api/tips/:id
+```
+
+Returns detailed information about a specific tip, including its content, metadata, and vote counts.
+
+## Path parameters
+
+<ParamField path="id" type="number" required>
+  Unique identifier of the tip to retrieve
+</ParamField>
+
+## Response
+
+Returns a single tip object with all fields:
+
+<ResponseField name="id" type="number">
+  Unique tip identifier
+</ResponseField>
+
+<ResponseField name="slug" type="string">
+  URL-friendly slug generated from the title
+</ResponseField>
+
+<ResponseField name="title" type="string">
+  Tip title
+</ResponseField>
+
+<ResponseField name="content" type="string">
+  Full tip content with details and examples
+</ResponseField>
+
+<ResponseField name="tags" type="array">
+  Array of tag strings categorizing the tip
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Publication status (always `published` for publicly accessible tips)
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp when the tip was created
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  ISO 8601 timestamp when the tip was last updated
+</ResponseField>
+
+<ResponseField name="love_count" type="number">
+  Number of positive votes (vote: 1)
+</ResponseField>
+
+<ResponseField name="meh_count" type="number">
+  Number of negative votes (vote: -1)
+</ResponseField>
+
+## Examples
+
+<CodeGroup>
+```bash Get tip by ID
+curl http://localhost:3000/api/tips/42
+```
+
+```bash With ETag caching
+curl -H "If-None-Match: \"v-abc123\"" http://localhost:3000/api/tips/42
+```
+
+```javascript JavaScript fetch
+const response = await fetch('http://localhost:3000/api/tips/42');
+const tip = await response.json();
+console.log(tip.title);
+```
+
+```python Python requests
+import requests
+
+response = requests.get('http://localhost:3000/api/tips/42')
+tip = response.json()
+print(tip['title'])
+```
+</CodeGroup>
+
+### Success response (200)
+
+```json
+{
+  "id": 42,
+  "slug": "use-clear-role-definitions",
+  "title": "Use clear role definitions",
+  "content": "When prompting AI, start with a clear role definition like 'You are an expert Python developer...' to set context and improve response quality.",
+  "tags": ["basics", "roles"],
+  "status": "published",
+  "created_at": "2024-01-15T10:30:00.000Z",
+  "updated_at": "2024-01-15T10:30:00.000Z",
+  "love_count": 15,
+  "meh_count": 2
+}
+```
+
+### Not found response (404)
+
+```json
+{
+  "error": "Not found"
+}
+```
+
+## Caching
+
+This endpoint supports ETag-based caching. The server returns:
+- `Cache-Control` header with `max-age` and `stale-while-revalidate` directives
+- `ETag` header with a version identifier
+
+Send the ETag in subsequent requests using the `If-None-Match` header:
+
+```bash
+curl -H "If-None-Match: \"v-abc123\"" http://localhost:3000/api/tips/42
+```
+
+If the content hasn't changed, the server responds with:
+- Status: `304 Not Modified`
+- Empty body
+- Same ETag header
+
+This reduces bandwidth and improves performance for frequently accessed tips.
+
+## Error responses
+
+<ResponseField name="error" type="string">
+  Error message describing what went wrong
+</ResponseField>
+
+### 404 Not found
+
+Returned when the tip ID doesn't exist or the tip is not published:
+
+```json
+{
+  "error": "Not found"
+}
+```
+
+<Note>
+The API only returns tips with `status: "published"`. Draft or unpublished tips return 404 even if they exist.
+</Note>
+
+## Use cases
+
+### Permalink pages
+
+Use this endpoint to fetch tip data for dedicated tip pages:
+
+```javascript
+// Next.js example
+export async function getServerSideProps({ params }) {
+  const res = await fetch(`http://localhost:3000/api/tips/${params.id}`);
+  if (!res.ok) return { notFound: true };
+  const tip = await res.json();
+  return { props: { tip } };
+}
+```
+
+### Tip details modal
+
+Fetch full content when a user clicks on a tip in the list:
+
+```javascript
+async function showTipDetails(tipId) {
+  const response = await fetch(`/api/tips/${tipId}`);
+  const tip = await response.json();
+  // Display in modal or side panel
+  displayModal(tip);
+}
+```
+
+### Vote count refresh
+
+After voting, fetch updated counts:
+
+```javascript
+async function refreshTipCounts(tipId) {
+  const response = await fetch(`/api/tips/${tipId}`);
+  const tip = await response.json();
+  updateUI(tip.love_count, tip.meh_count);
+}
+```

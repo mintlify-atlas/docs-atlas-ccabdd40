@@ -1,0 +1,253 @@
+---
+title: Vote on tips
+description: Submit votes to express preference for prompt tips
+---
+
+## Endpoint
+
+```
+POST /api/tips/:id/vote
+```
+
+Submits a vote for a specific tip. Users can vote positive (love), negative (meh), or neutral to remove a previous vote. The endpoint tracks votes per user to prevent duplicates and returns updated vote counts.
+
+## Path parameters
+
+<ParamField path="id" type="number" required>
+  Unique identifier of the tip to vote on
+</ParamField>
+
+## Request body
+
+<ParamField body="vote" type="number" required>
+  Vote value. Must be one of:
+  - `1`: Positive vote (love)
+  - `-1`: Negative vote (meh)
+  - `0`: Neutral (removes previous vote)
+</ParamField>
+
+<ParamField body="userToken" type="string" required>
+  Unique identifier for the user submitting the vote. This should be generated client-side and stored persistently.
+  
+  Example: `u_7f3a9c2e1b4d`
+</ParamField>
+
+<Note>
+The `userToken` is used to track votes and prevent duplicate voting. Generate a unique token for each user (e.g., using `crypto.randomUUID()` or a similar method) and store it in localStorage or a cookie.
+</Note>
+
+## Response
+
+Returns the tip ID and updated vote counts:
+
+<ResponseField name="id" type="number">
+  Tip identifier that was voted on
+</ResponseField>
+
+<ResponseField name="love_count" type="number">
+  Total number of positive votes after this vote
+</ResponseField>
+
+<ResponseField name="meh_count" type="number">
+  Total number of negative votes after this vote
+</ResponseField>
+
+## Examples
+
+<CodeGroup>
+```bash Submit positive vote
+curl -X POST http://localhost:3000/api/tips/42/vote \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vote": 1,
+    "userToken": "u_7f3a9c2e1b4d"
+  }'
+```
+
+```bash Submit negative vote
+curl -X POST http://localhost:3000/api/tips/42/vote \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vote": -1,
+    "userToken": "u_7f3a9c2e1b4d"
+  }'
+```
+
+```bash Remove vote
+curl -X POST http://localhost:3000/api/tips/42/vote \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vote": 0,
+    "userToken": "u_7f3a9c2e1b4d"
+  }'
+```
+
+```javascript JavaScript fetch
+const userToken = localStorage.getItem('userToken') || generateUserToken();
+
+const response = await fetch('http://localhost:3000/api/tips/42/vote', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ vote: 1, userToken })
+});
+
+const result = await response.json();
+console.log(`Love: ${result.love_count}, Meh: ${result.meh_count}`);
+```
+
+```python Python requests
+import requests
+
+response = requests.post(
+  'http://localhost:3000/api/tips/42/vote',
+  json={'vote': 1, 'userToken': 'u_7f3a9c2e1b4d'}
+)
+
+result = response.json()
+print(f"Love: {result['love_count']}, Meh: {result['meh_count']}")
+```
+</CodeGroup>
+
+### Success response (200)
+
+```json
+{
+  "id": 42,
+  "love_count": 16,
+  "meh_count": 2
+}
+```
+
+## Vote behavior
+
+The voting system implements the following logic:
+
+### Changing votes
+
+Users can change their vote by submitting a different value:
+- Previous vote: `1` (love), new vote: `-1` (meh) → decrements love_count, increments meh_count
+- Previous vote: `-1` (meh), new vote: `1` (love) → decrements meh_count, increments love_count
+
+### Removing votes
+
+Submit vote value `0` to remove a previous vote:
+- Previous vote: `1` (love), new vote: `0` → decrements love_count
+- Previous vote: `-1` (meh), new vote: `0` → decrements meh_count
+
+### Duplicate votes
+
+If the same `userToken` submits the same `vote` value again, the endpoint returns current counts without modification. This is idempotent behavior.
+
+## Error responses
+
+### 400 Bad request - Invalid vote
+
+```json
+{
+  "error": "Invalid vote"
+}
+```
+
+Returned when `vote` is not `1`, `0`, or `-1`.
+
+### 400 Bad request - Missing userToken
+
+```json
+{
+  "error": "Missing userToken"
+}
+```
+
+Returned when the `userToken` field is not provided in the request body.
+
+### 429 Too many requests
+
+```json
+{
+  "error": "Busy, please retry"
+}
+```
+
+Returned when the vote endpoint is busy processing another vote for the same tip. The system uses file-based locking to ensure vote integrity.
+
+**Recommended retry strategy:**
+```javascript
+async function voteWithRetry(tipId, vote, userToken, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    const response = await fetch(`/api/tips/${tipId}/vote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vote, userToken })
+    });
+    
+    if (response.status === 429) {
+      // Exponential backoff: 100ms, 200ms, 400ms
+      await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, i)));
+      continue;
+    }
+    
+    return response.json();
+  }
+  throw new Error('Vote failed after retries');
+}
+```
+
+### 500 Internal server error
+
+```json
+{
+  "error": "Error"
+}
+```
+
+Returned for unexpected server errors during vote processing.
+
+## Implementation notes
+
+### Generating user tokens
+
+Generate a unique token client-side and persist it:
+
+```javascript
+function getUserToken() {
+  let token = localStorage.getItem('userToken');
+  if (!token) {
+    token = `u_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    localStorage.setItem('userToken', token);
+  }
+  return token;
+}
+```
+
+### Optimistic UI updates
+
+Update the UI immediately, then sync with the server:
+
+```javascript
+async function handleVote(tipId, newVote) {
+  // Optimistic update
+  updateUIOptimistically(tipId, newVote);
+  
+  try {
+    const result = await voteWithRetry(tipId, newVote, getUserToken());
+    // Update with actual counts from server
+    updateUI(tipId, result.love_count, result.meh_count);
+  } catch (error) {
+    // Revert optimistic update
+    revertUIUpdate(tipId);
+    showError('Failed to submit vote');
+  }
+}
+```
+
+### Vote persistence
+
+Votes are persisted to the filesystem:
+- **Vote map**: JSON file tracking `userToken → vote` mappings
+- **Audit log**: Append-only log of all vote actions with timestamps
+- **Per-tip view**: Cached vote counts updated atomically
+- **Global view**: Aggregated data rebuilt periodically for the list endpoint
+
+<Note>
+Vote counts may take up to 15 seconds to appear in the list endpoint (`/api/tips`) due to micro-batching, but the vote endpoint immediately returns updated counts.
+</Note>

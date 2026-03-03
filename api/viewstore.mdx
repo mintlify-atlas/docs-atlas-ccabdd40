@@ -1,0 +1,426 @@
+---
+title: ViewStore
+description: Core class for managing tip views, caching, and vote aggregation with double-buffered global state
+---
+
+The `ViewStore` class is the central data layer for Prompt Tips. It manages an in-memory global view of all published tips, handles vote mutations with optimistic updates, and provides efficient querying with cursor-based pagination.
+
+## Overview
+
+ViewStore uses a double-buffered architecture to enable zero-downtime updates to the global view. It maintains:
+- **In-memory cache** (`this.mem`) for fast reads
+- **Double-buffered JSON files** (tips.view.a.json / tips.view.b.json) for persistence
+- **Per-tip view files** for individual tip state
+- **Dirty tracking** for micro-batched writes
+
+## Constructor
+
+```javascript
+import { ViewStore } from './lib/viewStore.js';
+
+const store = new ViewStore({
+  DATA: './data',
+  cacheMaxAge: 60,
+  swr: 300
+});
+```
+
+<ParamField path="DATA" type="string" required>
+  Root directory for data storage. The store will create subdirectories for tips, locks, and view files.
+</ParamField>
+
+<ParamField path="cacheMaxAge" type="number" default="60">
+  Cache-Control max-age in seconds for HTTP responses.
+</ParamField>
+
+<ParamField path="swr" type="number" default="300">
+  Stale-while-revalidate duration in seconds for HTTP caching.
+</ParamField>
+
+## Methods
+
+### init()
+
+Initializes the ViewStore by creating required directories, loading the active view pointer, and reading the global view into memory.
+
+```javascript
+await store.init();
+```
+
+<ResponseField name="return" type="Promise<void>">
+  Resolves when initialization is complete. If the global view file is missing or corrupted, it triggers a full rebuild.
+</ResponseField>
+
+<Note>
+  Always call `init()` before using any other ViewStore methods. If the active view file cannot be read, this method automatically calls `rebuildGlobal()` to reconstruct the view from per-tip files.
+</Note>
+
+**What it does:**
+1. Creates `DATA` directory and `.locks` subdirectory
+2. Reads or creates `tips.view.ptr` file to determine active buffer ('a' or 'b')
+3. Loads active global view JSON into memory
+4. Falls back to `rebuildGlobal()` if view file is missing
+
+---
+
+### select(options)
+
+Queries tips with filtering, sorting, and cursor-based pagination.
+
+```javascript
+const result = store.select({
+  sort: 'hot',
+  window: '24h',
+  cursor: null,
+  limit: 20
+});
+```
+
+<ParamField path="sort" type="string" default="'hot'">
+  Sort algorithm:
+  - `'hot'` - Reddit-style hot ranking (score and recency)
+  - `'new'` - Newest first by creation date
+  - `'top'` - Wilson score confidence interval (best rated)
+</ParamField>
+
+<ParamField path="window" type="string" default="'all'">
+  Time window filter:
+  - `'all'` - No time filter
+  - `'24h'` - Last 24 hours
+  - `'7d'` - Last 7 days
+</ParamField>
+
+<ParamField path="cursor" type="string | null" default="null">
+  Cursor for pagination in format `"YYYY-MM-DDTHH:mm:ss.sssZ_id"`. Use the `nextCursor` from previous result.
+</ParamField>
+
+<ParamField path="limit" type="number" default="20">
+  Maximum number of items to return.
+</ParamField>
+
+<ResponseField name="items" type="Array<object>">
+  Array of tip objects matching the query, sorted according to `sort` parameter.
+</ResponseField>
+
+<ResponseField name="nextCursor" type="string | null">
+  Cursor for the next page, or `null` if no more results. Format: `"created_at_id"`.
+</ResponseField>
+
+**Example response:**
+```javascript
+{
+  items: [
+    {
+      id: 42,
+      slug: 'write-clear-prompts',
+      title: 'Write clear prompts',
+      content: 'Be specific about what you want...',
+      tags: ['clarity', 'basics'],
+      status: 'published',
+      created_at: '2024-03-15T10:30:00.000Z',
+      updated_at: '2024-03-15T10:30:00.000Z',
+      love_count: 15,
+      meh_count: 2
+    }
+  ],
+  nextCursor: '2024-03-15T10:30:00.000Z_42'
+}
+```
+
+<Tip>
+  The `select()` method is pure and synchronous - it only reads from the in-memory cache. This makes it extremely fast even with thousands of tips.
+</Tip>
+
+---
+
+### getTip(id)
+
+Retrieves a single tip by ID from the in-memory cache.
+
+```javascript
+const tip = await store.getTip(123);
+```
+
+<ParamField path="id" type="number | string" required>
+  Tip ID. Will be coerced to a number.
+</ParamField>
+
+<ResponseField name="return" type="Promise<object | null>">
+  Tip object if found and published, otherwise `null`.
+</ResponseField>
+
+---
+
+### postVote(id, userToken, newVote)
+
+Records a user's vote on a tip. Handles vote changes, updates counts, and schedules a batch flush to the global view.
+
+```javascript
+const counts = await store.postVote(123, 'user-token-abc', 1);
+// { love_count: 16, meh_count: 2 }
+```
+
+<ParamField path="id" type="number" required>
+  Tip ID to vote on.
+</ParamField>
+
+<ParamField path="userToken" type="string" required>
+  Unique user identifier (e.g., hashed session token).
+</ParamField>
+
+<ParamField path="newVote" type="number" required>
+  Vote value:
+  - `1` - Love (upvote)
+  - `-1` - Meh (downvote)
+  - `0` - Remove vote
+</ParamField>
+
+<ResponseField name="love_count" type="number">
+  Updated love count for the tip.
+</ResponseField>
+
+<ResponseField name="meh_count" type="number">
+  Updated meh count for the tip.
+</ResponseField>
+
+**How it works:**
+1. Acquires an exclusive file lock for the tip
+2. Loads existing votes map from `tip-XXXXXX.votes.map.json`
+3. Calculates delta between old and new vote
+4. Updates votes map atomically
+5. Appends audit log entry (best-effort)
+6. Updates per-tip view file with new counts
+7. Patches in-memory global view immediately (optimistic update)
+8. Marks tip as dirty and schedules flush to disk
+9. Releases lock
+
+<Note>
+  If the lock cannot be acquired (another vote is in progress), this method throws `Error('Busy, retry')`. The client should retry after a short delay.
+</Note>
+
+<Tip>
+  `postVote()` uses optimistic updates - the in-memory cache is updated immediately, but the global view file is flushed in a micro-batch after 15 seconds. This reduces disk I/O while keeping the cache consistent.
+</Tip>
+
+---
+
+### rebuildGlobal()
+
+Performs a full rebuild of the global view by scanning all per-tip view files.
+
+```javascript
+await store.rebuildGlobal();
+```
+
+<ResponseField name="return" type="Promise<void>">
+  Resolves when rebuild is complete and the new global view is active.
+</ResponseField>
+
+**What it does:**
+1. Scans `DATA/tips/` directory for all shards (000-999)
+2. Reads all `*.view.json` files
+3. Filters for `status === 'published'`
+4. Constructs new global view object with metadata:
+   - `version`: Schema version (1)
+   - `generated_at`: ISO timestamp
+   - `tip_count`: Number of published tips
+   - `sha256_items`: Checksum of all tip IDs and created_at values
+   - `items`: Array of all tip view objects
+5. Writes to inactive buffer file atomically
+6. Flips pointer to activate new buffer
+7. Updates in-memory cache
+
+<Note>
+  This operation can be slow with thousands of tips. Use `flushDirty()` for incremental updates when possible.
+</Note>
+
+---
+
+### flushDirty()
+
+Flushes the in-memory global view to disk using the double-buffer swap mechanism. Only necessary if tips have been marked dirty via `postVote()` or other mutations.
+
+```javascript
+await store.flushDirty();
+```
+
+<ResponseField name="return" type="Promise<void>">
+  Resolves when the flush is complete. If no tips are dirty, returns immediately.
+</ResponseField>
+
+**Process:**
+1. Clears the scheduled flush timer
+2. If `dirty` set is empty, returns early
+3. Writes current `this.mem` to inactive buffer file
+4. Atomically updates pointer file to flip buffers
+5. Updates `this.ptr` property
+6. Clears `dirty` set
+
+<Tip>
+  `flushDirty()` is automatically scheduled 15 seconds after any `postVote()` call. You rarely need to call it manually unless you're shutting down the server gracefully.
+</Tip>
+
+---
+
+### etag()
+
+Generates an ETag for HTTP cache validation based on the active view file's mtime and size.
+
+```javascript
+const tag = store.etag();
+// "v-a3f5e8c9d1b2a7f6e4c8d9a1b2c3d4e5"
+```
+
+<ResponseField name="return" type="string">
+  ETag string in format `"v-{md5_hash}"`. Returns `"v-0"` if file cannot be read.
+</ResponseField>
+
+---
+
+### headers(res)
+
+Sets HTTP caching headers on an Express response object.
+
+```javascript
+app.get('/api/tips', (req, res) => {
+  store.headers(res);
+  const result = store.select({ sort: req.query.sort });
+  res.json(result);
+});
+```
+
+<ParamField path="res" type="Response" required>
+  Express response object.
+</ParamField>
+
+**Headers set:**
+- `Cache-Control: public, max-age={cacheMaxAge}, stale-while-revalidate={swr}`
+- `ETag: {etag()}`
+
+---
+
+## Internal Methods
+
+### _activePath()
+
+Returns the file path of the currently active global view buffer.
+
+```javascript
+const path = store._activePath();
+// "/data/tips.view.a.json"
+```
+
+---
+
+### _inactivePath()
+
+Returns the file path of the currently inactive global view buffer (used for writes).
+
+```javascript
+const path = store._inactivePath();
+// "/data/tips.view.b.json"
+```
+
+---
+
+### _scheduleFlush()
+
+Schedules a `flushDirty()` call 15 seconds in the future. If a flush is already scheduled, does nothing.
+
+---
+
+### _readAllPerTipViews()
+
+Internal method used by `rebuildGlobal()` to scan and load all per-tip view files.
+
+<ResponseField name="return" type="Promise<Array<object>>">
+  Array of all published tip view objects.
+</ResponseField>
+
+---
+
+### _sha(s)
+
+Computes SHA-256 hash of a string.
+
+<ParamField path="s" type="string" required>
+  Input string to hash.
+</ParamField>
+
+<ResponseField name="return" type="string">
+  Hexadecimal hash digest.
+</ResponseField>
+
+---
+
+## Properties
+
+<ResponseField name="DATA" type="string">
+  Root data directory path.
+</ResponseField>
+
+<ResponseField name="cacheMaxAge" type="number">
+  Cache-Control max-age in seconds.
+</ResponseField>
+
+<ResponseField name="swr" type="number">
+  Stale-while-revalidate duration in seconds.
+</ResponseField>
+
+<ResponseField name="mem" type="object | null">
+  In-memory global view object. `null` until `init()` is called.
+</ResponseField>
+
+<ResponseField name="ptr" type="'a' | 'b'">
+  Currently active buffer pointer.
+</ResponseField>
+
+<ResponseField name="dirty" type="Set<number>">
+  Set of tip IDs with pending updates (not yet flushed to disk).
+</ResponseField>
+
+<ResponseField name="flushTimer" type="Timeout | null">
+  Timer for scheduled flush, or `null` if no flush is scheduled.
+</ResponseField>
+
+---
+
+## Usage Example
+
+```javascript
+import { ViewStore } from './lib/viewStore.js';
+import express from 'express';
+
+const app = express();
+const store = new ViewStore({ DATA: './data', cacheMaxAge: 60, swr: 300 });
+
+// Initialize on startup
+await store.init();
+
+// List tips endpoint
+app.get('/api/tips', (req, res) => {
+  store.headers(res);
+  const { sort = 'hot', window = 'all', cursor, limit = 20 } = req.query;
+  const result = store.select({ sort, window, cursor, limit: Number(limit) });
+  res.json(result);
+});
+
+// Vote endpoint
+app.post('/api/tips/:id/vote', async (req, res) => {
+  const { id } = req.params;
+  const { vote } = req.body; // 1, -1, or 0
+  const userToken = req.cookies.user_token;
+  
+  try {
+    const counts = await store.postVote(Number(id), userToken, vote);
+    res.json(counts);
+  } catch (err) {
+    if (err.message === 'Busy, retry') {
+      return res.status(409).json({ error: 'Voting in progress, retry' });
+    }
+    throw err;
+  }
+});
+
+app.listen(3000);
+```

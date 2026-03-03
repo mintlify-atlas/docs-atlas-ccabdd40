@@ -1,0 +1,168 @@
+---
+title: Seeding data
+description: Learn how to populate your Prompt Tips database using the YAML seed format and seed script
+---
+
+The seeding script allows you to quickly populate your Prompt Tips database with initial data from a YAML file. This is useful for development, testing, or deploying with pre-configured content.
+
+## How seeding works
+
+The seed script reads tips from `data/seeds/tips.seed.yaml`, creates sharded directories, and generates three files per tip:
+
+- `tip-XXXXXX.yaml` - Source YAML
+- `tip-XXXXXX.view.json` - Optimized read view
+- `tip-XXXXXX.votes.map.json` - Vote tracking (initialized empty)
+
+<Info>
+Tips are automatically sharded by ID (`id % 1000`) to prevent directory bloat and improve filesystem performance.
+</Info>
+
+## YAML seed format
+
+Each tip in `data/seeds/tips.seed.yaml` follows this structure:
+
+```yaml data/seeds/tips.seed.yaml
+- id: 1
+  title: "Be explicit about output format"
+  content: "Ask for JSON with a schema or a bullet list with exact fields. Models follow structure better than vague requests."
+  tags: ["format","json"]
+  status: "published"
+  created_at: "2025-01-01T09:00:00Z"
+
+- id: 2
+  title: "Few-shot to set pattern"
+  content: "Give 2–3 short examples of input→output. Then write: 'Now continue with the same style on: <your input>'."
+  tags: ["fewshot","style"]
+  status: "published"
+  created_at: "2025-01-02T10:00:00Z"
+```
+
+### Required fields
+
+<Steps>
+  <Step title="id">
+    Unique numeric identifier for the tip. Used for sharding and file naming.
+  </Step>
+  
+  <Step title="title">
+    Short, descriptive title for the prompt tip.
+  </Step>
+  
+  <Step title="content">
+    The full text of the tip. Can be multiple sentences.
+  </Step>
+  
+  <Step title="created_at">
+    ISO 8601 timestamp indicating when the tip was created.
+  </Step>
+</Steps>
+
+### Optional fields
+
+- `tags` - Array of category tags for filtering
+- `status` - Publication status (`published` or `draft`). Defaults to `published`
+- `updated_at` - ISO 8601 timestamp. Defaults to `created_at` if omitted
+
+<Warning>
+Only tips with `status: "published"` will appear in the global view. Draft tips are stored but not publicly visible.
+</Warning>
+
+## Running the seed script
+
+<Steps>
+  <Step title="Prepare your seed file">
+    Create or edit `data/seeds/tips.seed.yaml` with your tips following the format above.
+  </Step>
+  
+  <Step title="Run the seeding script">
+    Execute the seed script from your project root:
+    
+    ```bash
+    node scripts/seed.mjs
+    ```
+    
+    The script will output the number of tips seeded:
+    
+    ```
+    Seeded 4 tips.
+    ```
+  </Step>
+  
+  <Step title="Rebuild the global view">
+    After seeding, rebuild the global view to make tips queryable:
+    
+    ```bash
+    node scripts/rebuild-global-view.mjs
+    ```
+    
+    See [Rebuilding views](/guides/rebuilding-views) for details.
+  </Step>
+</Steps>
+
+## Custom data directory
+
+By default, the script uses `./data` as the data directory. You can override this with the `DATA_DIR` environment variable:
+
+```bash
+DATA_DIR=/var/lib/prompt-tips/data node scripts/seed.mjs
+```
+
+<Tip>
+In production, set `DATA_DIR` to match your systemd service configuration (typically `/var/lib/prompt-tips/data`).
+</Tip>
+
+## File structure after seeding
+
+After seeding tip ID 1, you'll see:
+
+```
+data/
+└── tips/
+    └── 001/                    # Shard directory (1 % 1000 = 001)
+        ├── tip-000001.yaml
+        ├── tip-000001.view.json
+        └── tip-000001.votes.map.json
+```
+
+The view JSON file contains the optimized structure:
+
+```json tip-000001.view.json
+{
+  "id": 1,
+  "slug": "be-explicit-about-output-format",
+  "title": "Be explicit about output format",
+  "content": "Ask for JSON with a schema...",
+  "tags": ["format", "json"],
+  "status": "published",
+  "created_at": "2025-01-01T09:00:00Z",
+  "updated_at": "2025-01-01T09:00:00Z",
+  "love_count": 0,
+  "meh_count": 0
+}
+```
+
+## Re-seeding
+
+<Warning>
+Running the seed script multiple times will **overwrite** existing tip files with matching IDs. Vote counts in `.votes.map.json` will be reset to empty.
+</Warning>
+
+To safely update tips:
+
+1. Manually edit the individual `.yaml` files in `data/tips/{shard}/`
+2. Run `rebuild-global-view.mjs` to refresh the global view
+3. Or use the seed script only for initial deployment
+
+## Atomic writes
+
+The seed script uses atomic writes (write to `.tmp`, then rename) to prevent corruption:
+
+```javascript scripts/seed.mjs
+async function atomicWrite(file, content){
+  const tmp = file + '.tmp';
+  await fs.writeFile(tmp, content);
+  await fs.rename(tmp, file);
+}
+```
+
+This ensures files are never left in a partial state, even if the process is interrupted.

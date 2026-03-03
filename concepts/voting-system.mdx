@@ -1,0 +1,448 @@
+---
+title: Voting system
+description: Learn how Prompt Tips implements atomic, lock-based voting to ensure data consistency without a database
+---
+
+Prompt Tips implements a **filesystem-based voting system** that uses atomic file operations and locks to ensure vote consistency without requiring a database.
+
+## Overview
+
+Each tip tracks two metrics:
+
+- **love_count** - Number of upvotes (👍)
+- **meh_count** - Number of downvotes (👎)
+
+Votes are:
+- **Deduplicated** - One vote per user per tip
+- **Mutable** - Users can change their vote
+- **Atomic** - No race conditions or lost updates
+- **Auditable** - Full history in append-only log
+
+<Note>
+The system uses file locks to prevent concurrent vote modifications, ensuring consistency even under high load.
+</Note>
+
+## Vote values
+
+Each user can have one of three vote states:
+
+```javascript
+1  → Love (upvote)
+0  → No vote (neutral or vote removed)
+-1 → Meh (downvote)
+```
+
+## File-based storage
+
+For each tip, votes are stored in three files:
+
+### 1. Vote map (source of truth)
+
+```json
+// tip-000001.votes.map.json
+{
+  "user-abc123": 1,
+  "user-def456": -1,
+  "user-ghi789": 1,
+  "user-jkl012": 0
+}
+```
+
+Maps user tokens to their current vote value.
+
+### 2. Vote log (audit trail)
+
+```jsonl
+// tip-000001.votes.log.jsonl
+{"userToken":"user-abc123","old":0,"vote":1,"ts":"2024-03-15T10:30:00Z"}
+{"userToken":"user-def456","old":0,"vote":-1,"ts":"2024-03-15T10:31:00Z"}
+{"userToken":"user-abc123","old":1,"vote":-1,"ts":"2024-03-15T11:45:00Z"}
+```
+
+Append-only log in JSON Lines format. Each line records a vote change.
+
+### 3. View file (denormalized counts)
+
+```json
+// tip-000001.view.json
+{
+  "id": 1,
+  "title": "Use XML tags for structured prompts",
+  "love_count": 42,
+  "meh_count": 3,
+  // ... other fields
+}
+```
+
+Pre-computed vote totals for fast reads.
+
+<Info>
+The view file is derived data - it can always be recomputed from the vote map.
+</Info>
+
+## Atomic file locks
+
+To prevent race conditions, the system uses **exclusive file locks**:
+
+```javascript
+// From src/lib/utils.js:16
+lock: `${DATA}/.locks/tip-${id}.lock`
+```
+
+Locks are stored in a separate `.locks/` directory:
+
+```
+data/
+└── .locks/
+    ├── tip-1.lock
+    ├── tip-2.lock
+    └── tip-3.lock
+```
+
+### How locking works
+
+```javascript
+// From src/lib/viewStore.js:83
+async postVote(id, userToken, newVote){
+  const p = tipPaths(this.DATA, id);
+  await fs.mkdir(p.dir, { recursive: true });
+
+  // acquire lock
+  let lockHandle;
+  try { lockHandle = await fs.open(p.lock, 'wx'); }
+  catch { throw new Error('Busy, retry'); }
+
+  try {
+    // ... perform vote update
+  } finally {
+    try { await lockHandle?.close(); await fs.unlink(p.lock); } catch {}
+  }
+}
+```
+
+**Step-by-step:**
+
+1. **Try to create lock file** with `wx` flag (exclusive write)
+2. **If file exists** → Lock held by another request → Throw "Busy, retry"
+3. **If created** → Lock acquired → Proceed with update
+4. **In finally block** → Always close handle and delete lock file
+
+<Tip>
+The `wx` flag is atomic - only one process can create the file. This prevents race conditions.
+</Tip>
+
+## Vote update flow
+
+Here's the complete flow when a user votes:
+
+```javascript
+// From src/lib/viewStore.js:79
+async postVote(id, userToken, newVote){
+  const p = tipPaths(this.DATA, id);
+  await fs.mkdir(p.dir, { recursive: true });
+
+  // acquire lock
+  let lockHandle;
+  try { lockHandle = await fs.open(p.lock, 'wx'); }
+  catch { throw new Error('Busy, retry'); }
+
+  try {
+    // load votes map
+    let map = {};
+    try { map = JSON.parse(await fs.readFile(p.votesMap,'utf8')); } catch {}
+    const oldVote = map[userToken] ?? 0;
+    if(oldVote === newVote){
+      const tip = await this.getTip(id);
+      return { love_count: tip?.love_count ?? 0, meh_count: tip?.meh_count ?? 0 };
+    }
+
+    // delta
+    const delta = { love: 0, meh: 0 };
+    if(oldVote === 1) delta.love--;
+    if(oldVote === -1) delta.meh--;
+    if(newVote === 1) delta.love++;
+    if(newVote === -1) delta.meh++;
+
+    // write map atomically
+    map[userToken] = newVote;
+    await atomicWrite(fs, p.votesMap, map);
+    // append audit (best-effort)
+    await fs.appendFile(p.votesLog, JSON.stringify({ userToken, old: oldVote, vote: newVote, ts: new Date().toISOString() })+'\n').catch(()=>{});
+
+    // patch per-tip view
+    let view;
+    try { view = JSON.parse(await fs.readFile(p.view,'utf8')); }
+    catch {
+      const y = YAML.load(await fs.readFile(p.yaml,'utf8'));
+      view = {
+        id: y.id, slug: slugify(y.title),
+        title: y.title, content: y.content, tags: y.tags || [],
+        status: y.status, created_at: y.created_at, updated_at: y.updated_at,
+        love_count: 0, meh_count: 0
+      };
+    }
+    view.love_count += delta.love;
+    view.meh_count  += delta.meh;
+    await atomicWrite(fs, p.view, view);
+
+    // patch global in-memory & mark dirty for batch flush
+    if(this.mem){
+      const idx = this.mem.items.findIndex(x => x.id===Number(id));
+      if(idx>=0){
+        this.mem.items[idx].love_count = view.love_count;
+        this.mem.items[idx].meh_count  = view.meh_count;
+      }
+    }
+    this.dirty.add(Number(id));
+    this._scheduleFlush();
+
+    return { love_count: view.love_count, meh_count: view.meh_count };
+  } finally {
+    try { await lockHandle?.close(); await fs.unlink(p.lock); } catch {}
+  }
+}
+```
+
+### Breakdown
+
+<Accordion title="1. Acquire lock">
+```javascript
+let lockHandle;
+try { lockHandle = await fs.open(p.lock, 'wx'); }
+catch { throw new Error('Busy, retry'); }
+```
+
+Returns HTTP 429 if lock is busy.
+</Accordion>
+
+<Accordion title="2. Load vote map">
+```javascript
+let map = {};
+try { map = JSON.parse(await fs.readFile(p.votesMap,'utf8')); } catch {}
+const oldVote = map[userToken] ?? 0;
+```
+
+Defaults to empty object if file doesn't exist yet.
+</Accordion>
+
+<Accordion title="3. Check if vote changed">
+```javascript
+if(oldVote === newVote){
+  const tip = await this.getTip(id);
+  return { love_count: tip?.love_count ?? 0, meh_count: tip?.meh_count ?? 0 };
+}
+```
+
+No-op if user submits same vote again.
+</Accordion>
+
+<Accordion title="4. Calculate delta">
+```javascript
+const delta = { love: 0, meh: 0 };
+if(oldVote === 1) delta.love--;
+if(oldVote === -1) delta.meh--;
+if(newVote === 1) delta.love++;
+if(newVote === -1) delta.meh++;
+```
+
+Examples:
+- No vote → Love: `delta = { love: +1, meh: 0 }`
+- Love → Meh: `delta = { love: -1, meh: +1 }`
+- Meh → No vote: `delta = { love: 0, meh: -1 }`
+</Accordion>
+
+<Accordion title="5. Update vote map">
+```javascript
+map[userToken] = newVote;
+await atomicWrite(fs, p.votesMap, map);
+```
+
+Uses write-then-rename pattern for atomicity.
+</Accordion>
+
+<Accordion title="6. Append to audit log">
+```javascript
+await fs.appendFile(p.votesLog, JSON.stringify({ 
+  userToken, old: oldVote, vote: newVote, ts: new Date().toISOString() 
+})+'\n').catch(()=>{});
+```
+
+Best-effort - doesn't fail the vote if log append fails.
+</Accordion>
+
+<Accordion title="7. Update per-tip view">
+```javascript
+view.love_count += delta.love;
+view.meh_count  += delta.meh;
+await atomicWrite(fs, p.view, view);
+```
+
+Applies delta to existing counts.
+</Accordion>
+
+<Accordion title="8. Update in-memory global view">
+```javascript
+if(this.mem){
+  const idx = this.mem.items.findIndex(x => x.id===Number(id));
+  if(idx>=0){
+    this.mem.items[idx].love_count = view.love_count;
+    this.mem.items[idx].meh_count  = view.meh_count;
+  }
+}
+```
+
+Immediate update for instant read consistency.
+</Accordion>
+
+<Accordion title="9. Schedule batch flush">
+```javascript
+this.dirty.add(Number(id));
+this._scheduleFlush();
+```
+
+Marks tip dirty, will flush to disk after 15s.
+</Accordion>
+
+<Accordion title="10. Release lock">
+```javascript
+finally {
+  try { await lockHandle?.close(); await fs.unlink(p.lock); } catch {}
+}
+```
+
+Always runs, even if update fails.
+</Accordion>
+
+## Retry logic
+
+If a lock is busy, the server returns HTTP 429:
+
+```javascript
+// From src/server.js:44
+app.post('/api/tips/:id/vote', async (req, res) => {
+  const id = Number(req.params.id);
+  const { vote, userToken } = req.body || {};
+  if (![1,0,-1].includes(vote)) return res.status(400).json({ error: 'Invalid vote' });
+  if (!userToken) return res.status(400).json({ error: 'Missing userToken' });
+
+  try{
+    const counts = await store.postVote(id, userToken, vote);
+    res.json({ id, ...counts });
+  }catch(e){
+    const msg = /Busy/.test(e.message) ? 'Busy, please retry' : 'Error';
+    res.status(/Busy/.test(e.message)?429:500).json({ error: msg });
+  }
+});
+```
+
+**Client should retry with exponential backoff:**
+
+```javascript
+async function vote(tipId, voteValue) {
+  let attempts = 0;
+  while (attempts < 3) {
+    const res = await fetch(`/api/tips/${tipId}/vote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vote: voteValue, userToken: getUserToken() })
+    });
+    
+    if (res.ok) return await res.json();
+    if (res.status === 429) {
+      attempts++;
+      await sleep(100 * Math.pow(2, attempts)); // 200ms, 400ms, 800ms
+      continue;
+    }
+    throw new Error('Vote failed');
+  }
+}
+```
+
+<Warning>
+Locks should be held for milliseconds, not seconds. If a lock is consistently busy, investigate for bugs or excessive load.
+</Warning>
+
+## Ranking algorithms
+
+Votes are used to rank tips using different algorithms:
+
+### Hot ranking (default)
+
+```javascript
+// From src/lib/utils.js:20
+export function hot(score, created_at){
+  const s = Math.max(Math.abs(score), 1);
+  return Math.log10(s) + (Date.parse(created_at)/1000)/45000;
+}
+```
+
+Based on Reddit's "hot" algorithm:
+- **score** = love_count - meh_count
+- Logarithmic score weighting (10 votes ≠ 10x better than 1 vote)
+- Time decay (older posts rank lower)
+
+### Top ranking (Wilson score)
+
+```javascript
+// From src/lib/utils.js:25
+export function wilson(love, meh, z=1.96){
+  const n = love + meh; if(!n) return 0;
+  const p = love/n;
+  const denom = 1 + (z*z)/n;
+  const num = p + (z*z)/(2*n) - z * Math.sqrt((p*(1-p)+(z*z)/(4*n))/n);
+  return num/denom;
+}
+```
+
+Lower bound of Wilson score confidence interval:
+- Accounts for total vote count (low-confidence items rank lower)
+- 100% with 2 votes < 95% with 100 votes
+- Prevents "lucky" low-vote items from dominating
+
+<Tip>
+Use "hot" for engagement-driven feeds, "top" for quality-driven lists.
+</Tip>
+
+## Consistency guarantees
+
+### What's guaranteed
+
+✅ **No lost votes** - File locks prevent race conditions  
+✅ **No duplicate votes** - User token is unique key in vote map  
+✅ **Vote changes tracked** - Audit log records all transitions  
+✅ **Atomic updates** - Write-then-rename ensures no partial writes  
+✅ **Crash safety** - In-progress votes either complete or fail cleanly  
+
+### What's not guaranteed
+
+⚠️ **Immediate global view consistency** - In-memory updates are immediate, disk flushes are batched (15s delay)  
+⚠️ **Audit log durability** - Log appends are best-effort, may be lost on crash  
+⚠️ **Lock fairness** - No guarantee of FIFO order when multiple clients retry  
+
+<Info>
+The vote map is always consistent. The audit log and global view can be rebuilt from it if needed.
+</Info>
+
+## Recovery scenarios
+
+### Lost in-memory state (server crash)
+
+1. Per-tip view files are still accurate
+2. On restart, global view rebuilt from per-tip views
+3. No data loss
+
+### Corrupted view file
+
+1. View file can be regenerated from vote map
+2. Count love/meh votes from map
+3. Merge with YAML source data
+
+### Corrupted vote map
+
+1. Vote map can be rebuilt from audit log (if available)
+2. Replay log from beginning
+3. Final state = current vote map
+
+<Warning>
+If both vote map and audit log are corrupted, vote data is lost. Consider periodic backups for critical systems.
+</Warning>

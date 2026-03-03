@@ -1,0 +1,240 @@
+---
+title: Double buffering
+description: Understand how Prompt Tips uses double-buffered views to enable zero-downtime updates
+---
+
+Prompt Tips implements a **double-buffering pattern** for its global view files, allowing the system to update pre-computed data without blocking reads or causing downtime.
+
+## The problem
+
+When vote counts change, the global view file needs to be regenerated. A naive approach would:
+
+1. Delete or truncate the existing view file
+2. Write the new data
+3. Serve the new file
+
+This causes problems:
+- **Race conditions** - Readers might see incomplete data during writes
+- **Downtime** - No data available while writing
+- **Corruption risk** - Crashes during write leave no valid data
+
+## The solution: Double buffering
+
+Instead of one view file, we maintain **two** identical files and swap between them:
+
+- `tips.view.a.json`
+- `tips.view.b.json`
+- `tips.view.ptr` - points to the active one ('a' or 'b')
+
+<Note>
+This is the same technique used in graphics rendering to prevent screen tearing.
+</Note>
+
+## How it works
+
+### Structure
+
+```javascript
+// From src/lib/viewStore.js:14
+export class ViewStore {
+  constructor({ DATA, cacheMaxAge=60, swr=300 }){
+    this.DATA = DATA;
+    this.cacheMaxAge = cacheMaxAge;
+    this.swr = swr;
+    this.mem = null;   // in-memory global view
+    this.ptr = 'a';    // Current active pointer
+    // ...
+  }
+}
+```
+
+### Reading the active view
+
+```javascript
+// From src/lib/viewStore.js:34
+_activePath(){ 
+  return path.join(this.DATA, `tips.view.${this.ptr}.json`); 
+}
+
+_inactivePath(){ 
+  return path.join(this.DATA, `tips.view.${this.ptr==='a'?'b':'a'}.json`); 
+}
+```
+
+The active path returns whichever file the pointer currently references. The inactive path returns the other one.
+
+### Writing and swapping
+
+When updates need to be flushed:
+
+```javascript
+// From src/lib/viewStore.js:149
+async flushDirty(){
+  this.flushTimer && clearTimeout(this.flushTimer);
+  this.flushTimer = null;
+  if(this.dirty.size === 0) return;
+
+  // Rebuild global from current this.mem (lightweight) and swap double-buffer
+  const inactive = this._inactivePath();
+  const payload = {
+    version: 1,
+    generated_at: new Date().toISOString(),
+    tip_count: this.mem.items.length,
+    sha256_items: this._sha(this.mem.items.map(i=>`${i.id}:${i.created_at}`).sort().join('|')),
+    items: this.mem.items
+  };
+  await atomicWrite(fs, inactive, payload);
+  
+  // flip pointer
+  const nextPtr = this.ptr==='a' ? 'b' : 'a';
+  await fs.writeFile(path.join(this.DATA,'tips.view.ptr'), nextPtr+'\n');
+  this.ptr = nextPtr;
+  this.dirty.clear();
+}
+```
+
+**Step-by-step:**
+
+1. **Write to inactive file** - While 'a' is active, write new data to 'b'
+2. **Flip the pointer** - Update `tips.view.ptr` from 'a' to 'b'
+3. **New reads use new file** - Next read will use 'b' instead of 'a'
+4. **Old file remains valid** - 'a' still contains old data until next swap
+
+<Tip>
+The pointer file flip is atomic (single file write), so readers never see an invalid state.
+</Tip>
+
+## Visual example
+
+### Initial state
+
+```
+tips.view.ptr → "a"
+tips.view.a.json → [tip1, tip2, tip3] ← ACTIVE (being read)
+tips.view.b.json → [tip1, tip2, tip3]
+```
+
+### During update
+
+```
+tips.view.ptr → "a"
+tips.view.a.json → [tip1, tip2, tip3] ← ACTIVE (still being read)
+tips.view.b.json → [tip1, tip2, tip3, tip4] ← WRITING (new data)
+```
+
+### After pointer flip
+
+```
+tips.view.ptr → "b"
+tips.view.a.json → [tip1, tip2, tip3] ← STALE
+tips.view.b.json → [tip1, tip2, tip3, tip4] ← ACTIVE (now being read)
+```
+
+### Next update
+
+```
+tips.view.ptr → "b"
+tips.view.a.json → [tip1, tip2, tip3, tip4, tip5] ← WRITING (new data)
+tips.view.b.json → [tip1, tip2, tip3, tip4] ← ACTIVE (still being read)
+```
+
+## Micro-batching
+
+To avoid excessive writes, updates are batched:
+
+```javascript
+// From src/lib/viewStore.js:127
+// patch global in-memory & mark dirty for batch flush
+if(this.mem){
+  const idx = this.mem.items.findIndex(x => x.id===Number(id));
+  if(idx>=0){
+    this.mem.items[idx].love_count = view.love_count;
+    this.mem.items[idx].meh_count  = view.meh_count;
+  }
+}
+this.dirty.add(Number(id));
+this._scheduleFlush();
+```
+
+```javascript
+// From src/lib/viewStore.js:144
+_scheduleFlush(){
+  if(this.flushTimer) return;
+  this.flushTimer = setTimeout(()=> this.flushDirty().catch(console.error), 15000); // 15s micro-batch
+}
+```
+
+Votes are immediately reflected in the **in-memory** view, but the file flush is delayed by 15 seconds. Multiple votes within that window are batched into a single write.
+
+<Warning>
+If the server crashes before the flush timer fires, the in-memory changes are lost. Per-tip view files are still accurate, so a rebuild recovers the correct state.
+</Warning>
+
+## Global rebuild
+
+You can manually rebuild the global view from all per-tip views:
+
+```bash
+node scripts/rebuild-global-view.mjs
+```
+
+This script:
+
+```javascript
+// From scripts/rebuild-global-view.mjs:41
+async function main(){
+  await fs.mkdir(DATA, { recursive: true });
+  const items = await listPerTip();
+  const payload = {
+    version: 1,
+    generated_at: new Date().toISOString(),
+    tip_count: items.length,
+    sha256_items: sha(items.map(i=>`${i.id}:${i.created_at}`).sort().join('|')),
+    items
+  };
+  const cur = await readPtr();
+  const target = cur==='a' ? B : A;
+  await atomicWrite(target, payload);
+  await writePtr(cur==='a' ? 'b' : 'a');
+  console.log('Rebuilt global view →', cur==='a' ? 'b' : 'a', 'tips:', items.length);
+}
+```
+
+1. Reads all per-tip `.view.json` files
+2. Writes to the **inactive** buffer
+3. Flips the pointer
+
+<Info>
+Use this if in-memory state diverged from disk, or after manual data changes.
+</Info>
+
+## Benefits
+
+<Accordion title="Zero downtime">
+Readers always have a valid file to read from, even during updates.
+</Accordion>
+
+<Accordion title="Crash safety">
+If a write fails or the process crashes, the old file remains valid and serving traffic.
+</Accordion>
+
+<Accordion title="Rollback capability">
+The old view is preserved until the next update, enabling quick rollback if needed.
+</Accordion>
+
+<Accordion title="No locks on reads">
+Readers never block or wait - they simply read from the active file.
+</Accordion>
+
+## Tradeoffs
+
+**Pros:**
+- Simple implementation
+- No read locks needed
+- Atomic updates
+- Crash-safe
+
+**Cons:**
+- 2x storage space (one extra copy)
+- Old data persists until next update (minor staleness)
+- Pointer file is a single point of failure (but tiny and rarely written)

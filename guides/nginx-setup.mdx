@@ -1,0 +1,436 @@
+---
+title: nginx setup
+description: Configure nginx as a reverse proxy with intelligent caching for optimal performance
+---
+
+nginx serves as a high-performance reverse proxy in front of your Prompt Tips server, providing caching, static file serving, and SSL termination.
+
+## Why use nginx?
+
+<Steps>
+  <Step title="Performance">
+    nginx caches API responses, reducing load on the Node.js server and improving response times.
+  </Step>
+  
+  <Step title="Static file serving">
+    Efficiently serves frontend assets without hitting the application server.
+  </Step>
+  
+  <Step title="Graceful updates">
+    nginx can reload configuration without dropping connections, enabling zero-downtime deployments.
+  </Step>
+  
+  <Step title="Security">
+    Acts as a security boundary with request filtering, rate limiting, and SSL termination.
+  </Step>
+</Steps>
+
+## Configuration overview
+
+The example configuration at `nginx.example.conf` provides:
+
+- Proxy caching for `/api/tips` with 1-minute TTL
+- Cache bypass for POST requests (votes)
+- Stale cache serving during updates
+- Static file serving with fallback to `index.html`
+
+## Full configuration
+
+```nginx nginx.example.conf
+proxy_cache_path /var/cache/nginx/tips levels=1:2 keys_zone=tips_zone:10m
+                 inactive=10m max_size=1g;
+
+map $request_method $no_cache { default 0; POST 1; }
+
+server {
+  listen 80;
+  server_name your.domain;
+
+  location /api/tips {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+
+    proxy_cache tips_zone;
+    proxy_cache_bypass $no_cache;
+    proxy_no_cache $no_cache;
+    proxy_cache_valid 200 1m;
+    proxy_cache_use_stale updating error timeout http_500 http_502 http_503 http_504;
+
+    add_header X-Cache-Status $upstream_cache_status;
+  }
+
+  location / {
+    root /path/to/prompt-tips/public;
+    try_files $uri /index.html;
+  }
+}
+```
+
+## Installation
+
+<Steps>
+  <Step title="Install nginx">
+    ```bash
+    # Ubuntu/Debian
+    sudo apt update
+    sudo apt install nginx
+    
+    # CentOS/RHEL
+    sudo yum install nginx
+    ```
+  </Step>
+  
+  <Step title="Create cache directory">
+    ```bash
+    sudo mkdir -p /var/cache/nginx/tips
+    sudo chown -R www-data:www-data /var/cache/nginx/tips
+    ```
+  </Step>
+  
+  <Step title="Copy configuration">
+    ```bash
+    sudo cp nginx.example.conf /etc/nginx/sites-available/prompt-tips
+    ```
+  </Step>
+  
+  <Step title="Customize settings">
+    Edit `/etc/nginx/sites-available/prompt-tips`:
+    
+    - Replace `your.domain` with your actual domain
+    - Update `/path/to/prompt-tips/public` with correct path
+    - Adjust cache settings as needed
+  </Step>
+  
+  <Step title="Enable the site">
+    ```bash
+    sudo ln -s /etc/nginx/sites-available/prompt-tips \
+               /etc/nginx/sites-enabled/
+    ```
+  </Step>
+  
+  <Step title="Test configuration">
+    ```bash
+    sudo nginx -t
+    ```
+    
+    You should see:
+    ```
+    nginx: configuration file /etc/nginx/nginx.conf test is successful
+    ```
+  </Step>
+  
+  <Step title="Reload nginx">
+    ```bash
+    sudo systemctl reload nginx
+    ```
+  </Step>
+</Steps>
+
+## Cache configuration explained
+
+### Cache path
+
+```nginx
+proxy_cache_path /var/cache/nginx/tips levels=1:2 keys_zone=tips_zone:10m
+                 inactive=10m max_size=1g;
+```
+
+- `/var/cache/nginx/tips` - Cache storage directory
+- `levels=1:2` - Two-level directory hierarchy (prevents too many files in one directory)
+- `keys_zone=tips_zone:10m` - 10MB of shared memory for cache keys (holds ~80,000 keys)
+- `inactive=10m` - Remove cached items not accessed for 10 minutes
+- `max_size=1g` - Maximum cache size of 1GB
+
+<Info>
+The `keys_zone` memory stores cache metadata, not response bodies. 10MB is sufficient for thousands of cached responses.
+</Info>
+
+### Cache bypass for POST requests
+
+```nginx
+map $request_method $no_cache { default 0; POST 1; }
+
+proxy_cache_bypass $no_cache;
+proxy_no_cache $no_cache;
+```
+
+This ensures:
+- `GET /api/tips` → Cached
+- `POST /api/tips` → Bypasses cache (vote requests)
+
+<Warning>
+Never cache POST requests that modify data. This configuration ensures votes are processed immediately.
+</Warning>
+
+### Stale cache serving
+
+```nginx
+proxy_cache_use_stale updating error timeout http_500 http_502 http_503 http_504;
+```
+
+Serves stale cached responses when:
+- `updating` - Cache is being refreshed
+- `error` - Backend connection error
+- `timeout` - Backend timeout
+- `http_500/502/503/504` - Backend errors
+
+<Tip>
+This provides graceful degradation. Users see slightly stale data instead of errors during backend issues.
+</Tip>
+
+### Cache status header
+
+```nginx
+add_header X-Cache-Status $upstream_cache_status;
+```
+
+Adds a debug header showing cache status:
+- `HIT` - Served from cache
+- `MISS` - Cache miss, fetched from backend
+- `BYPASS` - Cache bypassed (POST request)
+- `STALE` - Served stale cached content
+- `UPDATING` - Cache refreshing in background
+
+Test it:
+
+```bash
+curl -I http://your.domain/api/tips | grep X-Cache-Status
+# X-Cache-Status: HIT
+```
+
+## Static file serving
+
+```nginx
+location / {
+  root /path/to/prompt-tips/public;
+  try_files $uri /index.html;
+}
+```
+
+- Serves files from `public/` directory
+- Falls back to `index.html` for client-side routing (SPA support)
+
+### Optimizing static files
+
+Add gzip compression and caching headers:
+
+```nginx
+location / {
+  root /path/to/prompt-tips/public;
+  try_files $uri /index.html;
+  
+  # Gzip compression
+  gzip on;
+  gzip_types text/css application/javascript application/json;
+  gzip_min_length 1000;
+  
+  # Cache static assets
+  location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+    expires 1y;
+    add_header Cache-Control "public, immutable";
+  }
+}
+```
+
+## SSL/TLS configuration
+
+Add HTTPS using Let's Encrypt:
+
+<Steps>
+  <Step title="Install Certbot">
+    ```bash
+    sudo apt install certbot python3-certbot-nginx
+    ```
+  </Step>
+  
+  <Step title="Obtain certificate">
+    ```bash
+    sudo certbot --nginx -d your.domain
+    ```
+  </Step>
+  
+  <Step title="Verify auto-renewal">
+    ```bash
+    sudo certbot renew --dry-run
+    ```
+  </Step>
+</Steps>
+
+Certbot automatically updates your nginx config:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name your.domain;
+  
+  ssl_certificate /etc/letsencrypt/live/your.domain/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/your.domain/privkey.pem;
+  
+  # ... rest of config
+}
+
+server {
+  listen 80;
+  server_name your.domain;
+  return 301 https://$server_name$request_uri;  # Redirect to HTTPS
+}
+```
+
+## Rate limiting
+
+Protect your API from abuse:
+
+```nginx
+# Add before server block
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
+server {
+  # ...
+  
+  location /api/tips {
+    limit_req zone=api_limit burst=20 nodelay;
+    
+    proxy_pass http://127.0.0.1:3000;
+    # ... rest of proxy config
+  }
+}
+```
+
+This allows:
+- 10 requests per second per IP
+- Burst of 20 requests
+- `nodelay` - Process burst immediately
+
+<Info>
+Adjust `rate` and `burst` based on your traffic patterns. Start conservative and increase if needed.
+</Info>
+
+## Cache management
+
+### Clear cache
+
+```bash
+sudo rm -rf /var/cache/nginx/tips/*
+sudo systemctl reload nginx
+```
+
+### Monitor cache size
+
+```bash
+du -sh /var/cache/nginx/tips
+```
+
+### Cache statistics
+
+Enable nginx status page:
+
+```nginx
+server {
+  listen 127.0.0.1:8080;
+  
+  location /nginx_status {
+    stub_status;
+    access_log off;
+  }
+}
+```
+
+Query it:
+
+```bash
+curl http://127.0.0.1:8080/nginx_status
+```
+
+## Troubleshooting
+
+### Cache not working
+
+Check cache status headers:
+
+```bash
+curl -I http://your.domain/api/tips | grep X-Cache-Status
+```
+
+If always `MISS`:
+1. Verify cache directory permissions: `ls -ld /var/cache/nginx/tips`
+2. Check nginx error log: `sudo tail -f /var/log/nginx/error.log`
+3. Ensure `proxy_cache tips_zone;` directive is present
+
+### 502 Bad Gateway
+
+Backend not reachable:
+
+```bash
+# Check if Node.js server is running
+sudo systemctl status prompt-tips
+
+# Test direct connection
+curl http://127.0.0.1:3000/api/tips
+
+# Check nginx error log
+sudo tail -f /var/log/nginx/error.log
+```
+
+### Permission denied errors
+
+```bash
+sudo chown -R www-data:www-data /var/cache/nginx/tips
+sudo chmod -R 750 /var/cache/nginx/tips
+```
+
+## Performance tuning
+
+### Worker processes
+
+Match CPU cores:
+
+```nginx
+# /etc/nginx/nginx.conf
+worker_processes auto;
+worker_connections 2048;
+```
+
+### Proxy buffering
+
+Optimize for small JSON responses:
+
+```nginx
+location /api/tips {
+  proxy_pass http://127.0.0.1:3000;
+  
+  proxy_buffering on;
+  proxy_buffer_size 4k;
+  proxy_buffers 8 4k;
+  proxy_busy_buffers_size 8k;
+  
+  # ... cache config
+}
+```
+
+### Connection reuse
+
+Keep backend connections alive:
+
+```nginx
+upstream prompt_tips {
+  server 127.0.0.1:3000;
+  keepalive 32;
+}
+
+server {
+  location /api/tips {
+    proxy_pass http://prompt_tips;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    
+    # ... cache config
+  }
+}
+```
+
+## Next steps
+
+- Monitor cache hit rates in access logs
+- Set up log rotation for `/var/log/nginx/`
+- Configure fail2ban for additional security
+- Add CDN (Cloudflare, CloudFront) for global distribution

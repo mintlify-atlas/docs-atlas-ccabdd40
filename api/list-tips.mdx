@@ -1,0 +1,195 @@
+---
+title: List tips
+description: Retrieve a paginated list of prompt tips with sorting and filtering options
+---
+
+## Endpoint
+
+```
+GET /api/tips
+```
+
+Returns a paginated list of published prompt tips. Supports multiple sorting algorithms, time-based filtering, and cursor-based pagination.
+
+## Query parameters
+
+<ParamField query="sort" type="string" default="hot">
+  Sorting algorithm for tips. Options:
+  - `hot`: Score-based ranking combining votes and recency (default)
+  - `new`: Most recently created tips first
+  - `top`: Highest-rated tips using Wilson score confidence interval
+</ParamField>
+
+<ParamField query="window" type="string" default="all">
+  Time window to filter tips by creation date. Options:
+  - `all`: All published tips (default)
+  - `24h`: Tips created in the last 24 hours
+  - `7d`: Tips created in the last 7 days
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Pagination cursor from a previous response's `nextCursor` field. Format: `{ISO_DATE}_{ID}`
+  
+  Example: `2024-01-15T10:30:00.000Z_42`
+</ParamField>
+
+<ParamField query="limit" type="number" default="20">
+  Maximum number of tips to return per page. Default and typical value is 20.
+</ParamField>
+
+## Response
+
+<ResponseField name="items" type="array">
+  Array of tip objects
+  
+  <Expandable title="Tip object properties">
+    <ResponseField name="id" type="number">
+      Unique tip identifier
+    </ResponseField>
+    
+    <ResponseField name="slug" type="string">
+      URL-friendly slug generated from the title
+    </ResponseField>
+    
+    <ResponseField name="title" type="string">
+      Tip title
+    </ResponseField>
+    
+    <ResponseField name="content" type="string">
+      Full tip content with details and examples
+    </ResponseField>
+    
+    <ResponseField name="tags" type="array">
+      Array of tag strings categorizing the tip
+    </ResponseField>
+    
+    <ResponseField name="status" type="string">
+      Publication status (always `published` in API responses)
+    </ResponseField>
+    
+    <ResponseField name="created_at" type="string">
+      ISO 8601 timestamp when the tip was created
+    </ResponseField>
+    
+    <ResponseField name="updated_at" type="string">
+      ISO 8601 timestamp when the tip was last updated
+    </ResponseField>
+    
+    <ResponseField name="love_count" type="number">
+      Number of positive votes (vote: 1)
+    </ResponseField>
+    
+    <ResponseField name="meh_count" type="number">
+      Number of negative votes (vote: -1)
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="nextCursor" type="string | null">
+  Cursor for fetching the next page. `null` if no more results. Pass this value to the `cursor` parameter for the next request.
+</ResponseField>
+
+<ResponseField name="cachedAt" type="string">
+  ISO 8601 timestamp when this response was generated
+</ResponseField>
+
+## Examples
+
+<CodeGroup>
+```bash Default request
+curl http://localhost:3000/api/tips
+```
+
+```bash Hot tips from last 24h
+curl "http://localhost:3000/api/tips?sort=hot&window=24h"
+```
+
+```bash Top-rated tips
+curl "http://localhost:3000/api/tips?sort=top&window=all&limit=10"
+```
+
+```bash Paginated request
+curl "http://localhost:3000/api/tips?cursor=2024-01-15T10:30:00.000Z_42&limit=20"
+```
+
+```bash With ETag caching
+curl -H "If-None-Match: \"v-abc123\"" http://localhost:3000/api/tips
+```
+</CodeGroup>
+
+### Response example
+
+```json
+{
+  "items": [
+    {
+      "id": 42,
+      "slug": "use-clear-role-definitions",
+      "title": "Use clear role definitions",
+      "content": "When prompting AI, start with a clear role definition like 'You are an expert Python developer...' to set context and improve response quality.",
+      "tags": ["basics", "roles"],
+      "status": "published",
+      "created_at": "2024-01-15T10:30:00.000Z",
+      "updated_at": "2024-01-15T10:30:00.000Z",
+      "love_count": 15,
+      "meh_count": 2
+    },
+    {
+      "id": 41,
+      "slug": "break-down-complex-tasks",
+      "title": "Break down complex tasks",
+      "content": "For complex requests, break them into smaller steps and ask the AI to tackle each one sequentially.",
+      "tags": ["advanced", "strategy"],
+      "status": "published",
+      "created_at": "2024-01-14T15:20:00.000Z",
+      "updated_at": "2024-01-14T15:20:00.000Z",
+      "love_count": 23,
+      "meh_count": 1
+    }
+  ],
+  "nextCursor": "2024-01-14T15:20:00.000Z_41",
+  "cachedAt": "2024-01-15T10:45:23.123Z"
+}
+```
+
+## Sorting algorithms
+
+### Hot
+
+The default `hot` algorithm combines vote score with time decay to surface trending tips. It calculates a score based on:
+- Net votes (love_count - meh_count)
+- Time since creation (older tips score lower)
+
+This keeps fresh, popular tips at the top.
+
+### New
+
+Sorts by `created_at` timestamp in descending order (newest first). Tips with the same timestamp are sorted by ID descending.
+
+### Top
+
+Uses Wilson score confidence interval to rank tips by quality, accounting for both positive and negative votes. This prevents tips with only a few votes from ranking too high.
+
+## Pagination
+
+The API uses cursor-based pagination for consistent results:
+
+1. Make initial request without `cursor` parameter
+2. Use the `nextCursor` from the response in the next request
+3. Continue until `nextCursor` is `null`
+
+<Note>
+Cursor format is `{created_at}_{id}`. Don't construct cursors manually—always use values from `nextCursor`.
+</Note>
+
+## Error responses
+
+This endpoint typically doesn't return errors. If the data store is unavailable, it returns an empty array:
+
+```json
+{
+  "items": [],
+  "nextCursor": null,
+  "cachedAt": "2024-01-15T10:45:23.123Z"
+}
+```

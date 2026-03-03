@@ -1,0 +1,303 @@
+---
+title: Caching strategy
+description: Learn how Prompt Tips uses ETags and stale-while-revalidate to minimize server load and maximize performance
+---
+
+Prompt Tips implements a **multi-layer caching strategy** that leverages HTTP standards to reduce server load and deliver fast responses to users.
+
+## Caching layers
+
+The system uses three complementary caching mechanisms:
+
+1. **ETags** - For conditional requests (304 Not Modified)
+2. **Cache-Control** - For browser and CDN caching
+3. **Stale-while-revalidate** - For background revalidation
+
+<Note>
+All three work together to minimize server load while keeping data fresh.
+</Note>
+
+## ETag generation
+
+ETags are generated from the **file metadata** of the active global view:
+
+```javascript
+// From src/lib/viewStore.js:37
+etag(){
+  try{
+    const st = fscb.statSync(this._activePath());
+    const src = `${st.mtimeMs}:${st.size}`;
+    return `"v-${crypto.createHash('md5').update(src).digest('hex')}"`;
+  }catch{ return `"v-0"`; }
+}
+```
+
+**How it works:**
+
+1. Get file stats for active view (tips.view.a.json or tips.view.b.json)
+2. Combine modification time + file size
+3. Hash with MD5
+4. Return as quoted ETag header
+
+<Tip>
+Using file metadata instead of content hashing is much faster - no need to read the entire file.
+</Tip>
+
+### Why mtime + size?
+
+- **mtime changes** when file is updated (even if size stays same)
+- **size changes** when content changes
+- Together they create a **unique fingerprint**
+- **Fast to compute** - just a stat() call, no file reads
+
+## Cache-Control headers
+
+Every response includes cache directives:
+
+```javascript
+// From src/lib/viewStore.js:45
+headers(res){
+  res.set('Cache-Control', `public, max-age=${this.cacheMaxAge}, stale-while-revalidate=${this.swr}`);
+  res.set('ETag', this.etag());
+}
+```
+
+Default values (configurable via environment variables):
+
+```javascript
+// From src/server.js:13
+const CACHE_MAX_AGE = Number(process.env.CACHE_MAX_AGE || 60);
+const SWR = Number(process.env.STALE_WHILE_REVALIDATE || 300);
+```
+
+- **max-age=60** - Cache is fresh for 60 seconds
+- **stale-while-revalidate=300** - Serve stale data for up to 300 seconds while revalidating
+
+## Stale-while-revalidate explained
+
+This is the most powerful part of the caching strategy.
+
+### Timeline example
+
+```
+t=0s   → Request 1: Cache miss, fetch from server (200 OK)
+t=30s  → Request 2: Cache hit, serve from cache
+t=70s  → Request 3: Cache stale (>60s), but within SWR window
+         → Immediately serve stale data to user (fast!)
+         → Background fetch to revalidate
+t=80s  → Request 4: Serve fresh data from background fetch
+```
+
+<Info>
+Users get instant responses even when cache is stale, and the cache is refreshed in the background.
+</Info>
+
+### Configuration options
+
+```bash
+# Conservative (fresher data, more server load)
+CACHE_MAX_AGE=30
+STALE_WHILE_REVALIDATE=60
+
+# Balanced (default)
+CACHE_MAX_AGE=60
+STALE_WHILE_REVALIDATE=300
+
+# Aggressive (less server load, slightly staler data)
+CACHE_MAX_AGE=120
+STALE_WHILE_REVALIDATE=600
+```
+
+## Conditional requests with ETag
+
+The server supports If-None-Match for efficient revalidation:
+
+```javascript
+// From src/server.js:23
+app.get('/api/tips', (req, res) => {
+  store.headers(res);
+  const { sort='hot', window='all', cursor, limit=20 } = req.query;
+  const { items, nextCursor } = store.select({ sort, window, cursor, limit });
+  const payload = { items, nextCursor, cachedAt: new Date().toISOString() };
+
+  const body = JSON.stringify(payload);
+  const tag = etag(body);
+  res.setHeader('ETag', tag);
+  if (req.headers['if-none-match'] === tag) return res.status(304).end();
+  res.json(payload);
+});
+```
+
+**Request flow:**
+
+1. Client sends: `If-None-Match: "v-abc123"`
+2. Server generates ETag for current data
+3. If tags match → `304 Not Modified` (no body, ~100 bytes)
+4. If tags differ → `200 OK` with full body (~10KB+)
+
+<Warning>
+Note that the `/api/tips` endpoint generates ETag from the response body, not the file metadata. This ensures the ETag accounts for query parameters like sort and window.
+</Warning>
+
+## Per-endpoint caching
+
+### List endpoint (GET /api/tips)
+
+```javascript
+// From src/server.js:23
+app.get('/api/tips', (req, res) => {
+  store.headers(res);  // Cache-Control + file-based ETag
+  // ...
+  const tag = etag(body);  // Content-based ETag for this response
+  res.setHeader('ETag', tag);
+  if (req.headers['if-none-match'] === tag) return res.status(304).end();
+  res.json(payload);
+});
+```
+
+- **Cache-Control** set via store.headers()
+- **ETag** computed from response body (varies by query params)
+- Supports **304 responses**
+
+### Detail endpoint (GET /api/tips/:id)
+
+```javascript
+// From src/server.js:36
+app.get('/api/tips/:id', async (req, res) => {
+  store.headers(res);
+  const id = Number(req.params.id);
+  const tip = await store.getTip(id);
+  if(!tip) return res.status(404).json({ error: 'Not found' });
+  res.json(tip);
+});
+```
+
+- Same caching strategy as list endpoint
+- Individual tips rarely change, so cache is very effective
+
+### Permalink page (GET /tips/:slugId)
+
+```javascript
+// From src/server.js:60
+app.get('/tips/:slugId', async (req, res) => {
+  // ...
+  const html = `<!doctype html>...`;
+  res.setHeader('Cache-Control', `public, max-age=${CACHE_MAX_AGE}, stale-while-revalidate=${SWR}`);
+  res.setHeader('ETag', etag(html));
+  if (req.headers['if-none-match'] === etag(html)) return res.status(304).end();
+  res.send(html);
+});
+```
+
+- Full HTML pages cached the same way as API responses
+- Great for SEO and social sharing
+
+## Vote endpoint (no caching)
+
+Write operations are never cached:
+
+```javascript
+// From src/server.js:44
+app.post('/api/tips/:id/vote', async (req, res) => {
+  // No cache headers - always executes
+  const id = Number(req.params.id);
+  const { vote, userToken } = req.body || {};
+  // ...
+});
+```
+
+<Warning>
+POST requests should never be cached. The browser and CDNs respect this by default.
+</Warning>
+
+## CDN compatibility
+
+This caching strategy works seamlessly with CDNs:
+
+<Accordion title="Cloudflare">
+- Respects `Cache-Control` headers
+- Supports `stale-while-revalidate`
+- Forwards `If-None-Match` to origin
+- Caches 304 responses
+</Accordion>
+
+<Accordion title="Fastly">
+- Full support for `stale-while-revalidate`
+- Configurable stale TTLs
+- ETag validation at edge
+</Accordion>
+
+<Accordion title="CloudFront">
+- Supports ETags
+- Partial support for `stale-while-revalidate` (use CloudFront Functions)
+- Can configure custom cache behaviors
+</Accordion>
+
+## Cache invalidation
+
+When does the cache invalidate?
+
+### Automatic invalidation
+
+1. **Vote received** → In-memory view updated immediately
+2. **15 seconds later** → Dirty tips flushed to disk
+3. **File written** → mtime changes
+4. **Next request** → ETag changes, cache misses
+
+### Manual invalidation
+
+```bash
+# Rebuild global view (updates mtime)
+node scripts/rebuild-global-view.mjs
+```
+
+This forces all caches to invalidate on next request.
+
+## Performance impact
+
+### Without caching
+
+- Every request reads from disk
+- Every response sends full JSON (~10KB)
+- 1000 req/s = 10MB/s bandwidth
+
+### With max-age=60
+
+- Browser caches for 60s
+- Reduces requests by ~90%
+- 100 req/s reaching server
+
+### With stale-while-revalidate=300
+
+- Cache revalidates in background
+- Near-instant responses for users
+- Server load spread over time instead of spikes
+
+<Tip>
+The combination of ETag + max-age + stale-while-revalidate gives you fast responses, fresh data, and low server load.
+</Tip>
+
+## Monitoring cache effectiveness
+
+Check response headers:
+
+```bash
+curl -I https://your-app.com/api/tips
+
+HTTP/1.1 200 OK
+cache-control: public, max-age=60, stale-while-revalidate=300
+etag: "v-a1b2c3d4e5f6"
+```
+
+Make the same request again:
+
+```bash
+curl -I https://your-app.com/api/tips \
+  -H 'If-None-Match: "v-a1b2c3d4e5f6"'
+
+HTTP/1.1 304 Not Modified
+cache-control: public, max-age=60, stale-while-revalidate=300
+etag: "v-a1b2c3d4e5f6"
+```
+
+✅ 304 response = caching working perfectly

@@ -1,0 +1,102 @@
+---
+title: Introduction
+description: A filesystem-backed tips feed with votes, ETag/SWR caching, and double-buffered global view—no database or Redis required.
+---
+
+# Introduction
+
+Prompt Tips is a lightweight, production-ready API for building voting-based content feeds without the complexity of traditional databases. Built on Node.js and Express, it uses the filesystem as its data layer with sophisticated caching and atomic write strategies.
+
+## Why Prompt Tips?
+
+Prompt Tips demonstrates that you don't always need a database to build fast, reliable APIs. It's designed for scenarios where:
+
+- **Simplicity matters**: No database setup, migrations, or connection pools
+- **Performance is critical**: ETag-based caching and stale-while-revalidate semantics
+- **Reliability is key**: Atomic writes with file locking prevent race conditions
+- **Scalability is practical**: Double-buffered global views enable zero-downtime updates
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get your first API running in under 5 minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Step-by-step setup with npm and environment configuration
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Complete endpoint documentation with examples
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Learn about the double-buffered view store design
+  </Card>
+</CardGroup>
+
+## Key features
+
+### Filesystem-backed persistence
+
+Every tip is stored as individual YAML and JSON files, making the data layer transparent and debuggable. No database schemas, just files you can inspect and version control.
+
+### Intelligent caching
+
+HTTP caching with ETags and `stale-while-revalidate` ensures clients get fast responses while the server revalidates in the background. Microcaching at the nginx layer can push cache hit rates even higher.
+
+### Real-time voting
+
+Atomically track upvotes and downvotes per tip with file-based locking. Vote changes update both per-tip views and the global in-memory index with micro-batch flushing.
+
+### Multiple sort strategies
+
+- **Hot**: Hacker News-style decay algorithm favoring recent engagement
+- **New**: Reverse chronological order
+- **Top**: Wilson score confidence interval for best content
+
+### Production-ready patterns
+
+<CardGroup cols={3}>
+  <Card title="Atomic writes" icon="lock">
+    File locking prevents concurrent modification conflicts
+  </Card>
+  <Card title="Double buffering" icon="arrows-rotate">
+    Zero-downtime global view rebuilds with pointer swapping
+  </Card>
+  <Card title="Micro-batching" icon="layer-group">
+    Efficient vote updates with scheduled flush cycles
+  </Card>
+</CardGroup>
+
+## Use cases
+
+Prompt Tips is perfect for:
+
+- **Internal tools**: Quick voting/feedback systems for teams
+- **Prototypes**: Test ideas without database overhead
+- **Edge deployments**: Run on platforms with filesystem access but limited database options
+- **Learning**: Study production patterns like caching, locking, and eventual consistency
+
+## Architecture overview
+
+The system uses a dual-layer storage approach:
+
+1. **Per-tip files**: Individual YAML source + JSON view files with vote counts
+2. **Global view**: In-memory aggregated index for fast queries, persisted to disk
+
+When votes arrive, they update the per-tip view atomically, patch the in-memory global view, and schedule a micro-batch flush to persist changes with zero downtime.
+
+<Note>
+The double-buffer pattern allows the server to rebuild the entire global view while serving requests from the current buffer, then atomically swap pointers when ready.
+</Note>
+
+## What's next?
+
+<Steps>
+  <Step title="Install dependencies">
+    Follow the [installation guide](/installation) to set up your environment
+  </Step>
+  <Step title="Run your first query">
+    Use the [quickstart](/quickstart) to get your API running in minutes
+  </Step>
+  <Step title="Explore the API">
+    Check out the [API reference](/api/overview) for all available endpoints
+  </Step>
+</Steps>

@@ -1,0 +1,421 @@
+---
+title: Installation
+description: Complete setup guide for Prompt Tips including npm installation, environment configuration, and initial data setup.
+---
+
+# Installation
+
+This guide covers everything you need to install and configure Prompt Tips for development or production.
+
+## System requirements
+
+- **Node.js**: Version 18.0.0 or higher
+- **npm**: Version 8.0.0 or higher (included with Node.js)
+- **Filesystem**: Write access for data directory
+- **Memory**: 512MB+ recommended for global view caching
+
+## Install dependencies
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone <your-repo-url>
+    cd prompt-tips
+    ```
+  </Step>
+
+  <Step title="Install npm packages">
+    ```bash
+    npm install
+    ```
+
+    This installs the following dependencies:
+
+    <CodeGroup>
+    ```json package.json
+    {
+      "dependencies": {
+        "express": "^4.19.2",
+        "etag": "^1.8.1",
+        "helmet": "^7.0.0",
+        "js-yaml": "^4.1.0"
+      }
+    }
+    ```
+    </CodeGroup>
+
+    <Info>
+    All dependencies are production-ready and actively maintained:
+    - **express**: Fast, minimalist web framework
+    - **etag**: Generate HTTP ETag headers for caching
+    - **helmet**: Security middleware for Express
+    - **js-yaml**: Parse YAML seed files
+    </Info>
+  </Step>
+</Steps>
+
+## Environment configuration
+
+<Steps>
+  <Step title="Copy environment template">
+    ```bash
+    cp .env.example .env
+    ```
+  </Step>
+
+  <Step title="Configure variables">
+    Edit `.env` with your preferred settings:
+
+    ```bash .env
+    PORT=3000
+    DATA_DIR=./data
+    CACHE_MAX_AGE=60
+    STALE_WHILE_REVALIDATE=300
+    MAX_JSON_BODY=4096
+    ```
+  </Step>
+</Steps>
+
+### Environment variables reference
+
+<ParamField path="PORT" type="number" default="3000">
+  HTTP port the server listens on.
+
+  ```bash
+  PORT=3000
+  ```
+</ParamField>
+
+<ParamField path="DATA_DIR" type="string" default="./data">
+  Directory for storing tip files, views, and vote data. Can be relative or absolute.
+
+  ```bash
+  DATA_DIR=./data
+  # or
+  DATA_DIR=/var/lib/prompt-tips/data
+  ```
+
+  <Warning>
+  Ensure this directory is writable and has sufficient disk space. Each tip requires ~5-10KB.
+  </Warning>
+</ParamField>
+
+<ParamField path="CACHE_MAX_AGE" type="number" default="60">
+  HTTP `Cache-Control: max-age` in seconds. Clients cache responses for this duration.
+
+  ```bash
+  CACHE_MAX_AGE=60  # 1 minute
+  ```
+
+  <Tip>
+  Set lower values (30-60s) for development, higher (300+) for production with stable content.
+  </Tip>
+</ParamField>
+
+<ParamField path="STALE_WHILE_REVALIDATE" type="number" default="300">
+  HTTP `stale-while-revalidate` in seconds. Allows serving stale cache while revalidating in background.
+
+  ```bash
+  STALE_WHILE_REVALIDATE=300  # 5 minutes
+  ```
+
+  This enables:
+  - Faster response times (serve from cache immediately)
+  - Background revalidation for fresh data
+  - Graceful degradation if server is slow
+</ParamField>
+
+<ParamField path="MAX_JSON_BODY" type="number" default="4096">
+  Maximum request body size in bytes for POST requests.
+
+  ```bash
+  MAX_JSON_BODY=4096  # 4KB
+  ```
+
+  <Note>
+  Vote requests are small (~100 bytes). This limit protects against malicious payloads.
+  </Note>
+</ParamField>
+
+## Initialize data
+
+Before starting the server, you need to seed initial data and build the global view.
+
+<Steps>
+  <Step title="Prepare seed data">
+    The seed file is located at `data/seeds/tips.seed.yaml`:
+
+    ```yaml data/seeds/tips.seed.yaml
+    - id: 1
+      title: "Be explicit about output format"
+      content: "Ask for JSON with a schema or a bullet list with exact fields."
+      tags: ["format", "json"]
+      status: "published"
+      created_at: "2025-01-01T09:00:00Z"
+
+    - id: 2
+      title: "Few-shot to set pattern"
+      content: "Give 2–3 short examples of input→output."
+      tags: ["fewshot", "style"]
+      status: "published"
+      created_at: "2025-01-02T10:00:00Z"
+    ```
+
+    <Tip>
+    Edit this file to customize your initial tips. Each tip requires: `id`, `title`, `content`, `status`, and `created_at`.
+    </Tip>
+  </Step>
+
+  <Step title="Run seed script">
+    ```bash
+    npm run seed
+    ```
+
+    This command:
+    1. Reads `data/seeds/tips.seed.yaml`
+    2. Creates per-tip directories (e.g., `data/tips/1/`)
+    3. Writes `.tip.yaml` source files
+    4. Generates `.view.json` files with initial vote counts (0)
+    5. Creates empty vote tracking files
+
+    <Info>
+    The seed script is idempotent—running it multiple times won't duplicate tips if IDs match.
+    </Info>
+  </Step>
+
+  <Step title="Build global view">
+    ```bash
+    npm run rebuild
+    ```
+
+    This command:
+    1. Scans all per-tip `.view.json` files
+    2. Aggregates them into a global index
+    3. Writes to `data/tips.view.a.json` and `data/tips.view.b.json`
+    4. Creates pointer file at `data/tips.view.ptr`
+
+    The global view structure:
+
+    ```json data/tips.view.a.json
+    {
+      "version": 1,
+      "generated_at": "2026-03-03T10:00:00Z",
+      "tip_count": 4,
+      "sha256_items": "abc123...",
+      "items": [
+        {
+          "id": 1,
+          "slug": "be-explicit-about-output-format",
+          "title": "Be explicit about output format",
+          "content": "...",
+          "tags": ["format", "json"],
+          "status": "published",
+          "created_at": "2025-01-01T09:00:00Z",
+          "updated_at": "2025-01-01T09:00:00Z",
+          "love_count": 0,
+          "meh_count": 0
+        }
+      ]
+    }
+    ```
+  </Step>
+</Steps>
+
+## Verify installation
+
+Check that all files are in place:
+
+```bash
+ls -la data/
+ls -la data/tips/1/
+```
+
+You should see:
+
+```
+data/
+├── seeds/
+│   └── tips.seed.yaml
+├── tips/
+│   ├── 1/
+│   │   ├── 1.tip.yaml
+│   │   └── 1.view.json
+│   ├── 2/
+│   │   ├── 2.tip.yaml
+│   │   └── 2.view.json
+│   └── ...
+├── tips.view.a.json
+├── tips.view.b.json
+└── tips.view.ptr
+```
+
+## Start the server
+
+<Tabs>
+  <Tab title="Development">
+    ```bash
+    npm run dev
+    ```
+
+    This starts the server with `NODE_ENV=development`.
+  </Tab>
+  <Tab title="Production">
+    ```bash
+    npm start
+    ```
+
+    This starts the server with `NODE_ENV=production`.
+
+    <Warning>
+    For production, use a process manager like PM2, systemd, or Docker to ensure the server restarts on crashes.
+    </Warning>
+  </Tab>
+</Tabs>
+
+You should see:
+
+```
+[tips] listening on :3000
+```
+
+## Validate endpoints
+
+Test that the API is working:
+
+```bash
+curl http://localhost:3000/api/tips?limit=1
+```
+
+Expected response:
+
+```json
+{
+  "items": [{ ... }],
+  "nextCursor": "...",
+  "cachedAt": "2026-03-03T10:15:30.123Z"
+}
+```
+
+## Available scripts
+
+Prompt Tips includes several npm scripts for common operations:
+
+<CodeGroup>
+```bash Development
+npm run dev
+# Starts server with NODE_ENV=development
+# Uses src/server.js
+```
+
+```bash Production
+npm start
+# Starts server with NODE_ENV=production
+# Uses src/server.js
+```
+
+```bash Seed data
+npm run seed
+# Runs scripts/seed.mjs
+# Reads data/seeds/tips.seed.yaml
+# Creates per-tip YAML and JSON files
+```
+
+```bash Rebuild view
+npm run rebuild
+# Runs scripts/rebuild-global-view.mjs
+# Scans all per-tip views
+# Rebuilds global aggregated index
+```
+</CodeGroup>
+
+## Troubleshooting
+
+### Server won't start
+
+<AccordionGroup>
+  <Accordion title="Port already in use">
+    ```bash
+    Error: listen EADDRINUSE: address already in use :::3000
+    ```
+
+    **Solution**: Change the `PORT` in `.env` or stop the process using port 3000:
+
+    ```bash
+    lsof -ti:3000 | xargs kill -9
+    ```
+  </Accordion>
+
+  <Accordion title="Cannot find module">
+    ```bash
+    Error: Cannot find module 'express'
+    ```
+
+    **Solution**: Install dependencies:
+
+    ```bash
+    npm install
+    ```
+  </Accordion>
+
+  <Accordion title="Permission denied on DATA_DIR">
+    ```bash
+    Error: EACCES: permission denied, mkdir './data'
+    ```
+
+    **Solution**: Ensure write permissions:
+
+    ```bash
+    chmod 755 ./data
+    # or
+    sudo chown $USER:$USER ./data
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### No tips returned
+
+<AccordionGroup>
+  <Accordion title="Empty items array">
+    ```json
+    {"items": [], "nextCursor": null, "cachedAt": "..."}
+    ```
+
+    **Solution**: Run seed and rebuild scripts:
+
+    ```bash
+    npm run seed
+    npm run rebuild
+    ```
+  </Accordion>
+
+  <Accordion title="Global view not found">
+    Check if `data/tips.view.ptr` and corresponding `.json` files exist:
+
+    ```bash
+    ls -la data/tips.view.*
+    ```
+
+    If missing, run:
+
+    ```bash
+    npm run rebuild
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart guide" icon="rocket" href="/quickstart">
+    Test your installation with real API requests
+  </Card>
+  <Card title="API reference" icon="code" href="/api/overview">
+    Explore all endpoints and query parameters
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the ViewStore and double-buffer design
+  </Card>
+  <Card title="Deployment" icon="server" href="/guides/deployment">
+    Deploy with nginx, PM2, and production best practices
+  </Card>
+</CardGroup>

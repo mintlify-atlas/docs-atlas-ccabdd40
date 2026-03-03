@@ -1,0 +1,230 @@
+---
+title: Rebuilding views
+description: Understand when and how to rebuild the global view cache for optimal query performance
+---
+
+The global view is a pre-computed JSON index of all published tips. It enables fast queries without scanning individual tip files on every request.
+
+## What is the global view?
+
+Instead of reading hundreds of individual `.view.json` files per request, Prompt Tips maintains a single consolidated file (`tips.view.a.json` or `tips.view.b.json`) containing all published tips.
+
+<Info>
+The system uses **double buffering** (A/B files) to allow atomic updates. One file serves requests while the other is being rebuilt, then a pointer flips to the new version.
+</Info>
+
+## When to rebuild
+
+Run the rebuild script whenever you:
+
+<Steps>
+  <Step title="Add new tips">
+    After running the seed script or manually adding tip files.
+  </Step>
+  
+  <Step title="Change tip status">
+    When publishing drafts or unpublishing tips.
+  </Step>
+  
+  <Step title="Edit tip content">
+    After modifying title, content, or tags in `.yaml` files.
+  </Step>
+  
+  <Step title="Suspect stale data">
+    If the API returns outdated content or incorrect counts.
+  </Step>
+</Steps>
+
+<Warning>
+Vote counts (`love_count`, `meh_count`) are **not** automatically synchronized during rebuild. The global view reflects votes at the time of rebuild.
+</Warning>
+
+## Running the rebuild script
+
+Execute from your project root:
+
+```bash
+node scripts/rebuild-global-view.mjs
+```
+
+You'll see output like:
+
+```
+Rebuilt global view → b tips: 47
+```
+
+This indicates:
+- The new active file is `tips.view.b.json`
+- 47 published tips were indexed
+
+## How it works
+
+The rebuild process follows these steps:
+
+<Steps>
+  <Step title="Scan all shards">
+    The script recursively reads all `.view.json` files from `data/tips/{shard}/`.
+  </Step>
+  
+  <Step title="Filter by status">
+    Only tips with `status: "published"` are included.
+    
+    ```javascript scripts/rebuild-global-view.mjs
+    const obj = JSON.parse(await fs.readFile(path.join(dir,f),'utf8'));
+    if(obj.status==='published') items.push(obj);
+    ```
+  </Step>
+  
+  <Step title="Generate metadata">
+    The script creates a payload with version, timestamp, count, and integrity hash.
+    
+    ```javascript scripts/rebuild-global-view.mjs
+    const payload = {
+      version: 1,
+      generated_at: new Date().toISOString(),
+      tip_count: items.length,
+      sha256_items: sha(items.map(i=>`${i.id}:${i.created_at}`).sort().join('|')),
+      items
+    };
+    ```
+  </Step>
+  
+  <Step title="Atomic write to inactive file">
+    Writes to the **inactive** file (A if B is current, or B if A is current).
+  </Step>
+  
+  <Step title="Flip pointer">
+    Updates `tips.view.ptr` to point to the newly rebuilt file.
+  </Step>
+</Steps>
+
+## Double buffering explained
+
+The system maintains three files:
+
+- `data/tips.view.a.json` - First buffer
+- `data/tips.view.b.json` - Second buffer  
+- `data/tips.view.ptr` - Pointer file (contains `a` or `b`)
+
+<CodeGroup>
+```bash Initial state
+# tips.view.ptr contains: a
+# Server reads from tips.view.a.json
+```
+
+```bash During rebuild
+# Script writes to tips.view.b.json
+# Server still reads from tips.view.a.json (no interruption)
+```
+
+```bash After pointer flip
+# tips.view.ptr now contains: b
+# Server reads from tips.view.b.json
+# tips.view.a.json is now the inactive buffer
+```
+</CodeGroup>
+
+<Tip>
+This approach ensures **zero downtime** during rebuilds. The API never serves partial or corrupted data.
+</Tip>
+
+## Custom data directory
+
+If you use a custom `DATA_DIR`, pass it as an environment variable:
+
+```bash
+DATA_DIR=/var/lib/prompt-tips/data node scripts/rebuild-global-view.mjs
+```
+
+## Integrity verification
+
+The `sha256_items` field provides a hash of all tip IDs and creation timestamps:
+
+```javascript scripts/rebuild-global-view.mjs
+sha256_items: sha(items.map(i=>`${i.id}:${i.created_at}`).sort().join('|'))
+```
+
+You can compare this hash across rebuilds to verify data consistency:
+
+```bash
+jq '.sha256_items' data/tips.view.a.json
+jq '.sha256_items' data/tips.view.b.json
+```
+
+## Automation
+
+For production, consider automating rebuilds:
+
+### Cron job
+
+Rebuild every 5 minutes:
+
+```cron
+*/5 * * * * cd /opt/prompt-tips && DATA_DIR=/var/lib/prompt-tips/data /usr/bin/node scripts/rebuild-global-view.mjs >> /var/log/prompt-tips-rebuild.log 2>&1
+```
+
+### Systemd timer
+
+Create `rebuild-global-view.timer` and `rebuild-global-view.service`:
+
+```ini rebuild-global-view.timer
+[Unit]
+Description=Rebuild Prompt Tips global view every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+```ini rebuild-global-view.service
+[Unit]
+Description=Rebuild Prompt Tips global view
+
+[Service]
+Type=oneshot
+Environment=DATA_DIR=/var/lib/prompt-tips/data
+WorkingDirectory=/opt/prompt-tips
+ExecStart=/usr/bin/node /opt/prompt-tips/scripts/rebuild-global-view.mjs
+User=www-data
+Group=www-data
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable rebuild-global-view.timer
+sudo systemctl start rebuild-global-view.timer
+```
+
+## Troubleshooting
+
+### No tips found
+
+```
+Rebuilt global view → a tips: 0
+```
+
+**Causes:**
+- No `.view.json` files exist (run the [seed script](/guides/seeding-data) first)
+- All tips have `status: "draft"`
+- Wrong `DATA_DIR` path
+
+### Stale pointer
+
+If the pointer file is corrupted, it defaults to `a`. Manually reset:
+
+```bash
+echo "a" > data/tips.view.ptr
+node scripts/rebuild-global-view.mjs
+```
+
+### Permission errors
+
+Ensure the script user has write access to `DATA_DIR`:
+
+```bash
+sudo chown -R www-data:www-data /var/lib/prompt-tips/data
+```

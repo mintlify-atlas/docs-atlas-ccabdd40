@@ -1,0 +1,89 @@
+---
+title: API overview
+description: Introduction to the Prompt Tips API for retrieving and voting on AI prompting tips
+---
+
+The Prompt Tips API provides simple REST endpoints to access a curated collection of AI prompting tips. All endpoints return JSON and support efficient caching with ETags and stale-while-revalidate.
+
+## Base URL
+
+```
+http://localhost:3000
+```
+
+For production deployments, replace `localhost:3000` with your production domain.
+
+## Authentication
+
+The Prompt Tips API does not require authentication for reading tips. For voting, you must provide a `userToken` in the request body to track user votes and prevent duplicates.
+
+<Note>
+The `userToken` should be a unique identifier for each user, such as `u_abc123`. Generate this client-side and store it persistently to track votes across sessions.
+</Note>
+
+## Response format
+
+All API responses are returned as JSON. Successful responses return data with appropriate HTTP status codes (200, 201, etc.), while errors return JSON objects with an `error` field.
+
+### Success response
+
+```json
+{
+  "items": [...],
+  "nextCursor": "2024-01-15T10:30:00.000Z_42",
+  "cachedAt": "2024-01-15T10:45:23.123Z"
+}
+```
+
+### Error response
+
+```json
+{
+  "error": "Not found"
+}
+```
+
+## Caching
+
+The API implements multiple caching strategies for optimal performance:
+
+- **ETags**: All responses include an `ETag` header for conditional requests
+- **Cache-Control**: Responses set `max-age` and `stale-while-revalidate` directives
+- **304 Not Modified**: Send `If-None-Match` header with ETag to get 304 responses when content hasn't changed
+
+### Example with ETags
+
+```bash
+curl -H "If-None-Match: \"v-abc123\"" http://localhost:3000/api/tips
+```
+
+If the content hasn't changed, you'll receive a `304 Not Modified` response with no body, saving bandwidth.
+
+## Rate limiting
+
+The API returns `429 Too Many Requests` when the vote endpoint is busy. Implement exponential backoff and retry logic for vote operations.
+
+## Error codes
+
+| Status Code | Description |
+|-------------|-------------|
+| `200` | Success |
+| `304` | Not Modified (ETag match) |
+| `400` | Bad Request (invalid parameters) |
+| `404` | Not Found (tip doesn't exist) |
+| `429` | Too Many Requests (vote endpoint busy) |
+| `500` | Internal Server Error |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="List tips" icon="list" href="/api/list-tips">
+    Get paginated tips with sorting and filtering
+  </Card>
+  <Card title="Get single tip" icon="file" href="/api/get-tip">
+    Retrieve a specific tip by ID
+  </Card>
+  <Card title="Vote on tips" icon="thumbs-up" href="/api/vote">
+    Submit votes on tips
+  </Card>
+</CardGroup>
