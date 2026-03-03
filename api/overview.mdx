@@ -74,6 +74,19 @@ The API returns `429 Too Many Requests` when the vote endpoint is busy. Implemen
 | `429` | Too Many Requests (vote endpoint busy) |
 | `500` | Internal Server Error |
 
+## Available endpoints
+
+The API provides the following endpoints:
+
+- **GET /api/tips** — List tips with pagination, sorting, and filtering
+- **GET /api/tips/:id** — Retrieve a single tip by ID
+- **POST /api/tips/:id/vote** — Submit a vote for a tip
+- **GET /tips/:slugId** — Permalink page with server-side rendered HTML (not JSON)
+
+<Info>
+The `/tips/:slugId` endpoint returns HTML for human-readable permalink pages, not JSON. Use `/api/tips/:id` for programmatic access.
+</Info>
+
 ## Next steps
 
 <CardGroup cols={2}>
