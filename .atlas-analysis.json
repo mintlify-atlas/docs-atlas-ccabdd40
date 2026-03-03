@@ -1,0 +1,90 @@
+{
+  "projectType": "api-service",
+  "projectName": "Prompt Tips",
+  "projectDescription": "Filesystem-backed tips feed API with voting, ETag caching, and double-buffered views",
+  "theme": "aspen",
+  "primaryColor": "#4F46E5",
+  "lightColor": "#818CF8",
+  "darkColor": "#3730A3",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/double-buffering",
+              "concepts/caching-strategy",
+              "concepts/voting-system"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/seeding-data",
+              "guides/rebuilding-views",
+              "guides/deployment",
+              "guides/nginx-setup"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/overview",
+              "api/list-tips",
+              "api/get-tip",
+              "api/vote"
+            ]
+          },
+          {
+            "group": "Core Classes",
+            "pages": [
+              "api/viewstore",
+              "api/utilities"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "REST API for tips feed with pagination",
+    "Voting system with atomic file-based locking",
+    "Double-buffered global view for zero-downtime updates",
+    "ETag and stale-while-revalidate caching",
+    "Filesystem-based persistence without database",
+    "Hot, Top, and New ranking algorithms",
+    "File sharding for scalability",
+    "Micro-batch flushing for vote updates"
+  ],
+  "publicApiSurface": [
+    "GET /api/tips",
+    "GET /api/tips/:id",
+    "POST /api/tips/:id/vote",
+    "GET /tips/:slugId",
+    "ViewStore.select()",
+    "ViewStore.getTip()",
+    "ViewStore.postVote()",
+    "ViewStore.rebuildGlobal()",
+    "hot(score, created_at)",
+    "wilson(love, meh)",
+    "atomicWrite()",
+    "tipPaths()",
+    "shard()"
+  ]
+}
